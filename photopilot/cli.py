@@ -49,6 +49,13 @@ def _gather_inputs(inputs: list[str]) -> list[Path]:
 
 
 def main(argv=None):
+    # Windows 控制台默认编码可能是 cp1252 / GBK，中文输出会抛 UnicodeEncodeError；
+    # 强制 UTF-8 并替换不可编码字符，保证在任意区域设置下都能正常打印。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     ap = argparse.ArgumentParser(prog="photopilot",
                                  description="照片筛选 / 追色 / 美化（全本地）")
     sub = ap.add_subparsers(dest="cmd", required=True)

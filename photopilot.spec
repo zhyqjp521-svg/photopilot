@@ -55,7 +55,7 @@ try:
     a.binaries += mp_bins
     a.hiddenimports += mp_hidden
 except Exception as e:
-    print(f"[warn] collect_all('mediapipe') 失败：{e}", file=sys.stderr)
+    print(f"[warn] collect_all('mediapipe') failed: {e}", file=sys.stderr)
 
 # onnxruntime：需要收集其原生动态库（DirectML/CPU 后端）
 try:
@@ -64,14 +64,14 @@ try:
     a.binaries += ort_bins
     a.hiddenimports += ort_hidden
 except Exception as e:
-    print(f"[warn] collect_all('onnxruntime') 失败：{e}", file=sys.stderr)
+    print(f"[warn] collect_all('onnxruntime') failed:{e}", file=sys.stderr)
 
 # opencv：cv2 原生库由 PyInstaller 钩子自动处理，此处补全子模块，
 # 确保 CascadeClassifier 的 haarcascade 数据文件被收集。
 try:
     a.datas += collect_data_files("cv2")
 except Exception as e:
-    print(f"[warn] collect_data_files('cv2') 失败：{e}", file=sys.stderr)
+    print(f"[warn] collect_data_files('cv2') failed:{e}", file=sys.stderr)
 
 # pywebview：GUI 后端，Windows 走 WebView2；无需数据文件，但补 hidden imports
 a.hiddenimports += collect_submodules("webview")
@@ -80,13 +80,13 @@ a.hiddenimports += collect_submodules("webview")
 try:
     a.datas += collect_data_files("rawpy")
 except Exception as e:
-    print(f"[warn] collect_data_files('rawpy') 失败：{e}", file=sys.stderr)
+    print(f"[warn] collect_data_files('rawpy') failed:{e}", file=sys.stderr)
 
 # send2trash：Windows/Linux 回收站（macOS 走 Foundation，无需此包）
 try:
     a.hiddenimports += collect_submodules("send2trash")
 except Exception as e:
-    print(f"[warn] collect_submodules('send2trash') 失败：{e}", file=sys.stderr)
+    print(f"[warn] collect_submodules('send2trash') failed:{e}", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # 常见缺漏补丁：这些包在隐式导入时可能被 PyInstaller 漏掉

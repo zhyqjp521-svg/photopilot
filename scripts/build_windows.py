@@ -29,6 +29,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Windows 控制台默认编码可能是 cp1252 / GBK，中文提示会抛 UnicodeEncodeError；
+# 强制标准输出用 UTF-8 并替换不可编码字符，保证构建脚本在任何区域设置下都能跑。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 ROOT = Path(__file__).resolve().parent.parent
 SPEC = ROOT / "photopilot.spec"
 
