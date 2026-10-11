@@ -100,6 +100,9 @@ def _build_command(name: str, console: bool) -> list[str]:
         "--exclude-module", "tkinter",
         "--exclude-module", "pandas",
         "--exclude-module", "IPython",
+        # onnxruntime 仅供已停用的 NIMA 美学模型使用（MODEL_LICENSE_VERIFIED=False），
+        # 当前代码路径不会 import 它；排除可显著减小体积。启用 NIMA 时需移除本行。
+        "--exclude-module", "onnxruntime",
         str(ENTRY),
     ]
 

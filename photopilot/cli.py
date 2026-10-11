@@ -144,6 +144,11 @@ def main(argv=None):
     pu.add_argument("--port", type=int, default=8618)
     pu.add_argument("--no-browser", action="store_true")
 
+    # 双击运行（无参数）时默认进入桌面窗口模式，而不是因缺少子命令直接退出。
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        argv = ["app"]
     args = ap.parse_args(argv)
 
     if args.cmd == "cull":
