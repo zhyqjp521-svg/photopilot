@@ -35,7 +35,7 @@ pip install pyinstaller
 
 > PyInstaller **不能跨平台交叉编译**：macOS / Linux 上无法产出 Windows .exe。
 > 必须把本仓库复制到 Windows 机器执行。本仓库已内置 `scripts/build_windows.py`
-> 与 `photopilot.spec`，在非 Windows 上运行构建脚本会直接报错提示。
+> 一键脚本，在非 Windows 上运行会直接报错提示。
 
 ## 四、打包步骤
 
@@ -58,10 +58,13 @@ python scripts\build_windows.py --console  :: 另生成带控制台的排障版
 python scripts\build_windows.py --clean    :: 构建前清理缓存
 ```
 
-或手动调用 PyInstaller：
+该脚本内部调用 PyInstaller（单文件 `--onefile` + 无控制台 `--windowed`），等价命令：
 
 ```bat
-pyinstaller --noconfirm --clean photopilot.spec
+pyinstaller --noconfirm --clean --onefile --windowed --name PhotoPilot ^
+  --collect-all mediapipe --collect-all onnxruntime ^
+  --collect-data cv2 --collect-data rawpy --collect-submodules send2trash ^
+  --exclude-module matplotlib --exclude-module tkinter run_photopilot.py
 ```
 
 ## 五、运行环境与依赖（目标机）
@@ -105,8 +108,8 @@ onnxruntime、Pillow、rawpy(LibRaw)、pywebview 等全部依赖。
 
 1. **入口脚本**：打包入口是仓库根的 `run_photopilot.py`（顶层脚本，避免
    `photopilot/__main__.py` 相对导入在 PyInstaller 下失败）。
-2. **mediapipe 资源**：spec 用 `collect_all("mediapipe")` 收集内置 tflite 人脸模型，
-   缺失会导致运行时人脸检测报错，勿手改删除。
+2. **mediapipe 资源**：脚本用 `--collect-all mediapipe` 收集内置 tflite 人脸模型，
+   缺失会导致运行时人脸检测报错，勿删除该参数。
 3. **双 OpenCV 共存**：若构建环境同时装了 `opencv-python-headless` 与
    `opencv-contrib-python`，建议二选一（推荐仅保留 `opencv-python-headless` 4.10，
    与 `pyproject.toml` 一致），避免体积膨胀与符号冲突。
@@ -114,7 +117,7 @@ onnxruntime、Pillow、rawpy(LibRaw)、pywebview 等全部依赖。
    首次启动解压到临时目录会稍慢，属 one-file 正常现象。
 5. **旧 NIMA 权重**：源码分发不含未授权权重，exe 同样不内置，`--ai` 会回退传统指标。
 6. **send2trash**：Windows/Linux 回收站依赖 `send2trash`（`pyproject.toml` 已按平台声明，
-   macOS 不装）。spec 已收集其子模块，缺失时删除原片会提示"缺少 send2trash"。
+   macOS 不装）。脚本已带 `--collect-submodules send2trash`，缺失时删除原片会提示"缺少 send2trash"。
 
 ## 八、验证建议（打包后）
 

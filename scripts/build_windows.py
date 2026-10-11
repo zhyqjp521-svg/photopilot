@@ -2,20 +2,19 @@
 """在 Windows 上把 PhotoPilot 打包为单文件可执行程序（PhotoPilot.exe）。
 
 用法（在 Windows 10/11 上，64 位 Python 3.10/3.11 环境）：
-    py -m venv .venv-win
+    py -3.11 -m venv .venv-win
     .venv-win\\Scripts\\activate
     pip install -e .
     pip install pyinstaller
     python scripts\\build_windows.py
 
 产物：
-    dist\\PhotoPilot.exe        —— 单文件、双击即用、无控制台窗口（--windowed）
-    dist\\PhotoPilot-console.exe（可选，--console 便于排障）
+    dist\\PhotoPilot.exe            —— 单文件、双击即用、无控制台窗口
+    dist\\PhotoPilot-console.exe    ——（可选 --console）带控制台，便于排障
 
 架构：
     始终针对运行本脚本的 Python 解释器架构打包。请使用 64 位 Python
     （官方 Windows 安装包默认即 x64），产物即为 x64（amd64）。
-    本项目不使用任何仅 x86 的依赖，无需 32 位构建。
 
 本脚本只负责“在 Windows 机器上打包”，不跨平台编译：
 macOS / Linux 无法产出 Windows .exe，请把本仓库拷到 Windows 上执行本脚本。
@@ -30,7 +29,7 @@ import sys
 from pathlib import Path
 
 # Windows 控制台默认编码可能是 cp1252 / GBK，中文提示会抛 UnicodeEncodeError；
-# 强制标准输出用 UTF-8 并替换不可编码字符，保证构建脚本在任何区域设置下都能跑。
+# 强制标准输出用 UTF-8 并替换不可编码字符，保证在任何区域设置下都能运行。
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")
@@ -38,7 +37,7 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 ROOT = Path(__file__).resolve().parent.parent
-SPEC = ROOT / "photopilot.spec"
+ENTRY = ROOT / "run_photopilot.py"
 
 
 def _banner(msg: str) -> None:
@@ -60,16 +59,49 @@ def _require_pyinstaller() -> None:
         sys.exit("缺少 PyInstaller：请先 `pip install pyinstaller`")
 
 
-def _ensure_data_dirs() -> None:
-    """确保 mediapipe 所需资源能被 collect；缺失时给出明确提示。"""
-    try:
-        import mediapipe
-    except ImportError:
-        sys.exit("缺少 mediapipe：请先 `pip install -e .` 安装项目依赖")
-    mp_dir = Path(mediapipe.__file__).resolve().parent
-    for rel in ("modules", "tasks"):
-        if not (mp_dir / rel).exists():
-            print(f"提示：mediapipe 缺少资源目录 {rel}（{mp_dir / rel}）", flush=True)
+def _ensure_deps() -> None:
+    """确认核心依赖已随 `pip install -e .` 装好，缺失时给出明确提示。"""
+    for mod, hint in (("numpy", "numpy"),
+                      ("cv2", "opencv-python-headless"),
+                      ("PIL", "Pillow"),
+                      ("mediapipe", "mediapipe"),
+                      ("onnxruntime", "onnxruntime")):
+        try:
+            __import__(mod)
+        except ImportError:
+            sys.exit(f"缺少依赖 {hint}：请先执行 `pip install -e .`")
+
+
+def _build_command(name: str, console: bool) -> list[str]:
+    """构造 PyInstaller 命令行。
+
+    用命令行而非 .spec：交给 PyInstaller 自己管理内部 TOC，避免手写 spec
+    在不同 PyInstaller 版本间的兼容问题。
+
+    --collect-all mediapipe   收集内置 tflite 人脸模型与子模块（缺了人脸检测会失效）
+    --collect-all onnxruntime 收集原生推理库
+    --collect-data cv2        收集 haarcascade 级联数据
+    --collect-data rawpy      收集 LibRaw 附带数据
+    --collect-submodules send2trash  Windows/Linux 回收站
+    """
+    window_flag = "--console" if console else "--windowed"
+    return [
+        sys.executable, "-m", "PyInstaller",
+        "--noconfirm", "--clean",
+        "--onefile",
+        window_flag,
+        "--name", name,
+        "--collect-all", "mediapipe",
+        "--collect-all", "onnxruntime",
+        "--collect-data", "cv2",
+        "--collect-data", "rawpy",
+        "--collect-submodules", "send2trash",
+        "--exclude-module", "matplotlib",
+        "--exclude-module", "tkinter",
+        "--exclude-module", "pandas",
+        "--exclude-module", "IPython",
+        str(ENTRY),
+    ]
 
 
 def main() -> int:
@@ -81,32 +113,25 @@ def main() -> int:
 
     _check_platform()
     _require_pyinstaller()
-    _ensure_data_dirs()
+    _ensure_deps()
+    if not ENTRY.exists():
+        sys.exit(f"找不到入口脚本：{ENTRY}")
 
     if args.clean:
         for d in ("build", "dist"):
             shutil.rmtree(ROOT / d, ignore_errors=True)
 
     _banner("打包 PhotoPilot.exe（x64，单文件，无控制台）")
-    cmd = [
-        sys.executable, "-m", "PyInstaller",
-        "--noconfirm", "--clean",
-        str(SPEC),
-    ]
+    cmd = _build_command("PhotoPilot", console=False)
     print("执行：", " ".join(cmd), flush=True)
     rc = subprocess.call(cmd, cwd=str(ROOT))
     if rc != 0:
         sys.exit(f"PyInstaller 返回码 {rc}，打包失败")
 
     if args.console:
-        _banner("生成排障版（带控制台，同名 *_console.exe）")
-        cmd2 = [
-            sys.executable, "-m", "PyInstaller",
-            "--noconfirm", "--clean",
-            "--name", "PhotoPilot-console", "--console",
-            str(SPEC),
-        ]
-        rc2 = subprocess.call(cmd2, cwd=str(ROOT))
+        _banner("生成排障版（带控制台，PhotoPilot-console.exe）")
+        rc2 = subprocess.call(_build_command("PhotoPilot-console", console=True),
+                              cwd=str(ROOT))
         if rc2 != 0:
             print(f"警告：排障版打包失败（返回码 {rc2}），主产物仍可用", flush=True)
 
