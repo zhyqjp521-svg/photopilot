@@ -1,0 +1,3 @@
+# Unverified model weights must not enter source distributions.
+prune photopilot/models
+prune models

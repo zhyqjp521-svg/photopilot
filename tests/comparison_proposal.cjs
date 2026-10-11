@@ -1,0 +1,25 @@
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
+const file=process.env.COMPARE_SOURCE||require('node:path').join(__dirname,'../photopilot/server.py');
+const raw=fs.existsSync(file)?fs.readFileSync(file,'utf8'):'';
+const start=raw.indexOf('let compareGroupId=null');
+const source=file.endsWith('.py')?raw.slice(start,raw.indexOf('/* ── 快审灯箱',start)):raw;
+function context(){
+ const elements=new Map(),panes=[];const calls=[];
+ function el(){const names=new Set();return {value:1,textContent:'',setAttribute(){},classList:{contains:n=>names.has(n),add:n=>names.add(n),remove:n=>names.delete(n),toggle(n,v){v?names.add(n):names.delete(n);}},style:{setProperty(){}},querySelectorAll(){return[];}};}
+ const ctx={console,Math,Number,String,devicePixelRatio:2,CULL_HISTORY:{applying:false},recordSelection(){},document:{activeElement:null,querySelectorAll:()=>panes},$:id=>{if(!elements.has(id))elements.set(id,el());return elements.get(id);},library:[{path:'/a',rating:0},{path:'/b',rating:0},{path:'/unrelated',rating:0}],ranked:[],selectedPaths:new Set(['/unrelated']),setRating:async(p,r)=>{calls.push([p.path,r]);p.rating=r;return true;},toast:()=>{},updateStats:()=>{},projectChanged:()=>{},syncBatchControls:()=>{},cardCache:new Map(),selectionTouched:false};
+ vm.createContext(ctx);vm.runInContext(source,ctx);return{ctx,panes,calls,run:s=>vm.runInContext(s,ctx)};
+}
+let count=0;
+async function test(name,fn){try{await fn();count++;console.log('PASS '+name);}catch(e){console.error('FAIL '+name+' '+e.message);process.exitCode=1;}}
+(async()=>{
+ await test('preview pixel zoom accounts for high DPI and fitted image',()=>{const c=context();assert.equal(c.run('comparePixelZoom({width:500,height:400,naturalWidth:2000,naturalHeight:1000})'),2);});
+ await test('portrait preview pixel zoom uses fitted height',()=>{const c=context();assert.equal(c.run('comparePixelZoom({width:500,height:400,naturalWidth:1000,naturalHeight:2000})'),2.5);});
+ await test('preview pixel mode remains pixel accurate when pane resizes',()=>{const c=context();const img={naturalWidth:2000,naturalHeight:1000,style:{}};const pane={dataset:{path:'/a'},clientWidth:1000,clientHeight:800,querySelector:()=>img};c.panes.push(pane);c.run('compareView={zoom:2,x:0,y:0,pixelPath:"/a"};updateCompareView()');assert.equal(c.run('compareView.zoom'),1);});
+ await test('pane geometry pans proportional to fitted image, not empty pane margins',()=>{const c=context();const g=c.run('compareImageGeometry({width:800,height:500,naturalWidth:1000,naturalHeight:1000},2,.1,-.1)');assert.equal(g.width,500);assert.equal(g.height,500);assert.equal(g.x,100);assert.equal(g.y,-100);});
+ await test('compare number shortcut rates only active pane',async()=>{const c=context();c.ctx.$('compareModal').classList.add('show');c.run('compareItems=library.slice(0,2);compareActivePath="/b"');assert.equal(c.ctx.compareShortcut({key:'3',preventDefault(){},target:{tagName:'DIV'}}),true);await Promise.resolve();assert.deepEqual(c.calls,[['/b',3]]);assert.equal(c.ctx.library[2].rating,0);});
+ await test('input and modifier/repeat/composition shortcuts ignored',()=>{const c=context();c.ctx.$('compareModal').classList.add('show');c.run('compareItems=library.slice(0,2);compareActivePath="/b"');for(const extra of [{repeat:true},{isComposing:true},{metaKey:true},{ctrlKey:true},{altKey:true},{shiftKey:true},{target:{tagName:'INPUT'}},{target:{tagName:'TEXTAREA'}},{target:{isContentEditable:true}}])assert.equal(c.ctx.compareShortcut({key:'3',preventDefault(){},...extra}),false);assert.deepEqual(c.calls,[]);});
+ await test('keep and reject touch active photo only',()=>{const c=context();c.ctx.$('compareModal').classList.add('show');c.run('compareItems=library.slice(0,2);compareActivePath="/b"');c.ctx.compareKeep(true);assert.deepEqual([...c.ctx.selectedPaths],['/unrelated','/b']);c.ctx.compareKeep(false);assert.deepEqual([...c.ctx.selectedPaths],['/unrelated']);});
+ await test('close invalidates loads and clears drag handlers',()=>{const c=context();const p={onpointermove:()=>{},querySelector:()=>({onload:()=>{},onerror:()=>{}}),hasPointerCapture:()=>false};c.panes.push(p);c.run('compareItems=library.slice(0,2);compareActivePath="/b"');c.ctx.closeGroupCompare();assert.equal(p.onpointermove,null);assert.equal(c.run('compareItems.length'),0);assert.equal(c.run('compareActivePath'),null);});
+ await test('pointer cancel ends drag and releases capture',()=>{const c=context();let released=false;const pane={clientWidth:500,clientHeight:400,querySelector:()=>({naturalWidth:2000,naturalHeight:1000}),setPointerCapture(){},hasPointerCapture:()=>true,releasePointerCapture(){released=true;},dataset:{path:'/a'}};c.run('compareView.zoom=2');c.ctx.bindComparePan(pane);pane.onpointerdown({target:{closest:()=>null},pointerId:1,clientX:1,clientY:1});assert.equal(typeof pane.onpointermove,'function');pane.onpointercancel({pointerId:1});assert.equal(pane.onpointermove,null);assert.equal(released,true);});
+ if(!process.exitCode)console.log(`${count} comparison checks passed`);
+})();

@@ -7,7 +7,7 @@
 - 对比度：RMS 对比度
 - 色彩丰富度：Hasler & Süsstrunk (2003) 指标
 - 人脸质量：Haar 检测 + 人脸区域清晰度（无人脸照片取中性值，不惩罚风光）
-- 连拍去重：dHash 感知哈希，序列上相邻且 Hamming 距离小的归为一组，
+- 连拍去重：dHash 感知哈希，相邻及组首帧同时接近且目录、比例兼容的归为一组，
   组内仅最高分保留，其余打 "burst-dup" 标记
 """
 from __future__ import annotations
@@ -37,6 +37,10 @@ W_SHARP, W_EXPOSURE, W_CONTRAST, W_COLOR, W_FACE = 0.35, 0.25, 0.12, 0.08, 0.20
 # flags（中文，直接呈现给用户）
 F_BLURRY, F_EXPOSURE, F_LOW, F_DUP = "可能模糊", "曝光异常", "低分", "连拍重复"
 F_BLINK, F_BLINK_ONE = "闭眼", "疑似眨眼"
+
+# Hamming distance (64 bits), relative aspect-ratio tolerance.
+# Balanced retains the historical distance threshold of 8.
+SIMILARITY_PROFILES = {"strict": (4, .12), "balanced": (8, .18), "loose": (12, .25)}
 
 
 @dataclass
@@ -245,23 +249,39 @@ def score_photo(img_work: np.ndarray, path: str | Path,
 
 
 def _group_bursts(photos: list[PhotoScore], hashes: dict[str, np.ndarray],
-                  max_hamming: int = 8) -> None:
-    """按文件名顺序做一维聚类：相邻两张 dHash 距离小 → 同一连拍组。"""
+                  max_hamming: int = 8, aspect_tolerance: float = .18) -> None:
+    """按文件名顺序分组，同时匹配前帧与组首帧，避免相邻相似链无限漂移。
+
+    dHash 不含尺寸或目录语义，故相同哈希也不能跨目录、横竖构图归组。
+    不读取原片、EXIF 或磁盘状态；离线项目也能按已有扫描信息重新分组。
+    """
     ordered = sorted(photos, key=lambda p: p.path)
+    for p in ordered:
+        p.flags[:] = [flag for flag in p.flags if flag != F_DUP]
+        p.group_size, p.group_rank, p.group_best = 1, 1, False
     gid = 0
     prev_photo: PhotoScore | None = None
+    anchor: PhotoScore | None = None
     for p in ordered:
         h = hashes.get(p.path)
         if h is None:
             p.group = -1
             prev_photo = None
+            anchor = None
             continue
         if (prev_photo is not None
+                and anchor is not None
+                and Path(p.path).parent == Path(anchor.path).parent
+                and min(p.width, p.height, anchor.width, anchor.height) > 0
+                and max(p.width * anchor.height, anchor.width * p.height)
+                / min(p.width * anchor.height, anchor.width * p.height) - 1 <= aspect_tolerance
+                and np.count_nonzero(h != hashes[anchor.path]) <= max_hamming
                 and np.count_nonzero(h != hashes[prev_photo.path]) <= max_hamming):
             p.group = prev_photo.group  # 加入上一张所在组
         else:
             p.group = gid               # 开启新组
             gid += 1
+            anchor = p
         prev_photo = p
 
     # 组内（≥2 张）只留最高分，其余标连拍重复
@@ -368,8 +388,15 @@ def _scan_parallel(paths: list[str], jobs: int, faces: bool = True, ai: bool = F
     return results
 
 
-def finalize_cull(photos: list[PhotoScore], hashes: dict[str, np.ndarray]) -> None:
-    """全量到齐后的收尾：批内相对模糊标记 + 连拍分组（原地修改）。"""
+def finalize_cull(photos: list[PhotoScore], hashes: dict[str, np.ndarray],
+                  similarity_profile: str = "balanced") -> None:
+    """收尾：批内相对模糊标记 + 连拍分组，支持 strict/balanced/loose。
+
+    无效档位在修改任何照片前抛出 ValueError；旧调用默认为 balanced。
+    """
+    if not isinstance(similarity_profile, str) or similarity_profile not in SIMILARITY_PROFILES:
+        raise ValueError("similarity_profile must be strict, balanced or loose")
+    max_hamming, aspect_tolerance = SIMILARITY_PROFILES[similarity_profile]
     # 模糊标记改为批内相对判定：同一批里显著低于中位数的才算"糊"，
     # 避免低纹理题材（雾景/极简/纯色背景）被绝对阈值全军覆没
     if photos:
@@ -380,7 +407,7 @@ def finalize_cull(photos: list[PhotoScore], hashes: dict[str, np.ndarray]) -> No
                 p.flags.append(F_BLURRY)
             elif p.sharpness >= thresh and F_BLURRY in p.flags:
                 p.flags.remove(F_BLURRY)
-    _group_bursts(photos, hashes)
+    _group_bursts(photos, hashes, max_hamming=max_hamming, aspect_tolerance=aspect_tolerance)
 
 
 def cull_folder(folder: str | Path, recursive: bool = False,

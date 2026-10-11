@@ -5,8 +5,9 @@ ONNX 格式 12.8MB，CPU 推理约 60-90ms/张（M1 实测）。
 
 来源与许可：
 - 方法论出自 Google 论文 NIMA（IEEE CVPR 2018）
-- 权重源自 AVA 数据集上训练的 MobileNetV2 美学模型（Apache-2.0 系生态的
-  ONNX 转换版），经 HuggingFace `cromsc/nima-mobilenet-aesthetic` 分发
+- 本地旧权重经 HuggingFace `cromsc/nima-mobilenet-aesthetic` 分发；截至
+  2026-09-30 上游没有模型卡或明确权重许可证，不能推定为 Apache-2.0。
+  默认停用，且不作为可商用资产打包。恢复前需核实具体权重授权。
 - 融合策略参考 Facet（github.com/ncoevoet/facet）与商业筛片软件的实践：
   AI 分与传统指标加权融合，硬伤规则（闭眼/模糊/连拍重复）仍然一票否决
 
@@ -27,11 +28,14 @@ _BINS = np.arange(1, 11, dtype=np.float32)
 
 _tls = threading.local()
 _available: bool | None = None
+MODEL_LICENSE_VERIFIED = False
 
 
 def available() -> bool:
     """模型文件是否存在且 onnxruntime 可导入（结果缓存）。"""
     global _available
+    if not MODEL_LICENSE_VERIFIED:
+        return False
     if _available is None:
         try:
             import onnxruntime  # noqa: F401

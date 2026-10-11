@@ -33,26 +33,63 @@ class PolishParams:
     blemish: float = 0.0     # 肤色局部瑕疵抑制 0-1
     local_region: str = "all"  # all | skin | face | eyes | background
     auto_tone: bool = False  # 智能自动曝光/阴影/高光修正
+    exposure: float = 0.0   # 手动曝光 EV，-3..3
+    contrast: float = 0.0   # -1..1
+    highlights: float = 0.0 # -1..1
+    shadows: float = 0.0    # -1..1
+    temperature: float = 0.0 # 相对冷暖，-1..1（不是 Kelvin）
+    saturation: float = 0.0 # -1..1
+
+    def __post_init__(self):
+        for name in ('wb', 'skin', 'retain', 'clarity', 'face_repair', 'blemish',
+                     'exposure', 'contrast', 'highlights', 'shadows', 'temperature', 'saturation'):
+            value = float(getattr(self, name))
+            limit = 3.0 if name == 'exposure' else 1.0
+            lower = -limit if name in {'exposure', 'contrast', 'highlights', 'shadows', 'temperature', 'saturation'} else 0.0
+            if not np.isfinite(value) or not lower <= value <= limit:
+                raise ValueError(f'{name} 需在 {lower:g} 到 {limit:g} 之间')
+        if self.local_region not in {'all', 'global', '全图', 'skin', 'face', 'eyes', 'background'}:
+            raise ValueError('未知局部区域')
 
 
 # ------------------------------------------------------------ 引导滤波
 
-def guided_filter(guide: np.ndarray, src: np.ndarray,
-                  radius: int, eps: float) -> np.ndarray:
-    """He et al. 引导滤波（boxFilter 实现），输入 float32 2D。"""
+def _guided_stats(guide: np.ndarray, radius: int) -> tuple[np.ndarray, np.ndarray]:
+    """同一引导图的均值/方差可在 RGB 三通道间复用。"""
     r = max(1, int(radius))
     k = 2 * r + 1
 
     def box(x):
         return cv2.boxFilter(x, -1, (k, k), normalize=True, borderType=cv2.BORDER_REFLECT)
 
-    mean_i, mean_p = box(guide), box(src)
-    corr_ii, corr_ip = box(guide * guide), box(guide * src)
+    mean_i = box(guide)
+    corr_ii = box(guide * guide)
     var_i = corr_ii - mean_i * mean_i
+    return mean_i, var_i
+
+
+def _guided_apply(guide: np.ndarray, src: np.ndarray, radius: int, eps: float,
+                  mean_i: np.ndarray, var_i: np.ndarray) -> np.ndarray:
+    """以已有引导图统计量滤波，保留原来的运算顺序和精度。"""
+    r = max(1, int(radius))
+    k = 2 * r + 1
+
+    def box(x):
+        return cv2.boxFilter(x, -1, (k, k), normalize=True, borderType=cv2.BORDER_REFLECT)
+
+    mean_p = box(src)
+    corr_ip = box(guide * src)
     cov_ip = corr_ip - mean_i * mean_p
     a = cov_ip / (var_i + eps)
     b = mean_p - a * mean_i
     return box(a) * guide + box(b)
+
+
+def guided_filter(guide: np.ndarray, src: np.ndarray,
+                  radius: int, eps: float) -> np.ndarray:
+    """He et al. 引导滤波（boxFilter 实现），输入 float32 2D。"""
+    mean_i, var_i = _guided_stats(guide, radius)
+    return _guided_apply(guide, src, radius, eps, mean_i, var_i)
 
 
 # ------------------------------------------------------------ 各处理步骤
@@ -66,7 +103,7 @@ def estimate_wb_gains(img: np.ndarray) -> np.ndarray:
     本张的通道均值搬到批次目标（"校到灰"的倒数形式，方向不能反）。
     """
     f = img.astype(np.float32)
-    return f.reshape(-1, 3).mean(0)
+    return np.maximum(f.reshape(-1, 3).mean(0), 1e-6)
 
 
 def batch_target_gains(gains_list: list[np.ndarray]) -> np.ndarray:
@@ -93,6 +130,38 @@ def auto_white_balance(img: np.ndarray, strength: float = 0.5) -> np.ndarray:
     return _blend(img, out, strength)
 
 
+def adjust_tone(img: np.ndarray, *, exposure: float = 0.0, contrast: float = 0.0,
+                highlights: float = 0.0, shadows: float = 0.0,
+                temperature: float = 0.0, saturation: float = 0.0) -> np.ndarray:
+    """原创基础调色；曝光在线性光下进行，阴影/高光使用连续软权重。"""
+    controls = (exposure, contrast, highlights, shadows, temperature, saturation)
+    if not all(np.isfinite(value) for value in controls):
+        raise ValueError('调色参数必须是有限数值')
+    if not any(controls):
+        return img.copy()
+    from .colorops import _SRGB_LUT
+    lin = _SRGB_LUT[img] * np.float32(2.0 ** np.clip(exposure, -3, 3))
+    if temperature:
+        t = float(np.clip(temperature, -1, 1))
+        lin *= np.array([2.0 ** (.35*t), 1.0, 2.0 ** (-.35*t)], np.float32)
+    f = linear_to_srgb(lin)
+    lum = luma(f)
+    if shadows or highlights:
+        shadow_weight = (1.0 - lum) ** 3
+        highlight_weight = lum ** 3
+        lift = float(np.clip(shadows, -1, 1)) * .55 * shadow_weight * lum
+        lift += float(np.clip(highlights, -1, 1)) * .30 * highlight_weight * lum
+        target = np.clip(lum + lift, 0, 1)
+        f *= (target / np.maximum(lum, 1e-6))[..., None]
+    if contrast:
+        amount = float(np.clip(contrast, -1, 1))
+        f = (f - .5) * (1.0 + .6 * amount) + .5
+    if saturation:
+        gray = luma(f)[..., None]
+        f = gray + (f - gray) * (1.0 + float(np.clip(saturation, -1, 1)))
+    return np.clip(f * 255.0 + .5, 0, 255).astype(np.uint8)
+
+
 def auto_tone(img: np.ndarray, strength: float = 1.0) -> np.ndarray:
     """按稳健亮度百分位自动修正曝光，并温和压回高光。
 
@@ -101,7 +170,9 @@ def auto_tone(img: np.ndarray, strength: float = 1.0) -> np.ndarray:
     三通道使用同一个亮度比例，尽量保持色相。完全裁剪的 JPEG 白块没有
     原始数据可恢复，RAW 才能在未同时裁剪的通道中保留部分高光信息。
     """
-    if strength <= 0:
+    if not np.isfinite(strength) or not 0 <= strength <= 1:
+        raise ValueError('自动曝光强度需为 0 到 1 之间的有限数值')
+    if strength == 0:
         return img.copy()
     if img.dtype != np.uint8 or img.ndim != 3 or img.shape[-1] != 3:
         raise ValueError("auto_tone 需要 RGB uint8 图像")
@@ -112,7 +183,7 @@ def auto_tone(img: np.ndarray, strength: float = 1.0) -> np.ndarray:
     # 采样降低大图上的百分位成本，同时保留稳定的全局判断。
     step = max(1, int(max(lum.shape[:2]) / 512))
     sample = lum[::step, ::step]
-    p02, p50, p98 = np.percentile(sample, [2, 50, 98]).astype(np.float32)
+    p50 = np.float32(np.percentile(sample, 50))
 
     # 18% 线性灰是摄影曝光的常用中灰目标；百分位而非均值不容易被
     # 天空/婚纱/黑背景等大面积极端区域牵着走。
@@ -133,11 +204,12 @@ def auto_tone(img: np.ndarray, strength: float = 1.0) -> np.ndarray:
     # 当作过曝区域；超过白点的数据只能压缩，不能凭空恢复纹理。
     lum2 = (work @ np.array([0.2126, 0.7152, 0.0722], np.float32)).astype(np.float32)
     hi = lum2 > 0.72
-    if np.any(hi) and (p98 > 0.72 or ev < -0.05):
+    if np.any(hi):
         t = np.maximum((lum2 - 0.72) / 0.28, 0.0)
-        a = np.float32(1.8)
-        compressed = 0.72 + 0.28 * (1.0 - np.exp(-a * t)) / (1.0 - np.exp(-a))
-        compressed = np.minimum(compressed, 1.0)
+        # A continuous shoulder with unit slope at the threshold, bounded
+        # strictly below white. Test post-gain luminance: dark scenes may create
+        # new highlights even when their original percentile was not bright.
+        compressed = 0.72 + 0.28 * t / (1.0 + t)
         ratio = np.where(hi, compressed / np.maximum(lum2, 1e-6), 1.0)
         work *= ratio[..., None]
 
@@ -160,8 +232,10 @@ def smooth_skin(img: np.ndarray, strength: float = 0.6, retain: float = 0.4,
     f = img.astype(np.float32) / 255.0
     guide = luma(f)[..., None]
 
-    base = np.stack([guided_filter(guide[..., 0], f[..., c], radius, 2.5e-3)
+    mean_i, var_i = _guided_stats(guide[..., 0], radius)
+    base = np.stack([_guided_apply(guide[..., 0], f[..., c], radius, 2.5e-3, mean_i, var_i)
                      for c in range(3)], axis=-1)
+    del mean_i, var_i
     detail = f - base
     out = base + retain * detail          # 高频衰减 → 肤色均匀但纹理还在
     out = np.clip(out, 0, 1) * 255.0
@@ -240,7 +314,8 @@ def repair_face(img: np.ndarray, mask: np.ndarray | None = None,
     return _masked_mix(img, fixed, mask, strength=float(strength))
 
 
-def _local_mask(img: np.ndarray, faces: list, region: str) -> np.ndarray:
+def _local_mask(img: np.ndarray, faces: list, region: str,
+                eye_boxes: list | None = None) -> np.ndarray:
     """按 UI 的局部区域选项生成 0–1 掩码。"""
     region = str(region or "all").lower()
     if region in {"all", "global", "全图"}:
@@ -250,7 +325,13 @@ def _local_mask(img: np.ndarray, faces: list, region: str) -> np.ndarray:
     if region == "face":
         return face_region_mask(img, infos) if infos else _boxes_mask(img, boxes)
     if region == "eyes":
-        return eye_region_mask(img, infos) if infos else np.zeros(img.shape[:2], np.float32)
+        if infos and any(f.mesh for f in infos):
+            return eye_region_mask(img, infos)
+        rois = _detect_eye_regions(img, boxes) if eye_boxes is None else eye_boxes
+        mask = np.zeros(img.shape[:2], np.float32)
+        for x, y, w, h in rois:
+            mask[y:y+h, x:x+w] = np.maximum(mask[y:y+h, x:x+w], _feather_patch((h, w)))
+        return mask
     if region == "skin":
         if infos and any(f.mesh for f in infos):
             return skin_mask_from_faces(img, infos, feather=max(9, min(img.shape[:2]) // 40))
@@ -283,29 +364,41 @@ def _eye_cascade():
     return _EYE_CASCADE_CACHE or None
 
 
+def _detect_eye_regions(img: np.ndarray, faces: list) -> list[tuple[int, int, int, int]]:
+    """Haar fallback shared by local masks and eye brightening."""
+    if not faces:
+        return []
+    ec = _eye_cascade()
+    if ec is None:
+        return []
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    h_img, w_img = gray.shape
+    rois = []
+    for fx, fy, fw, fh in faces:
+        x0, y0 = max(0, fx), max(0, fy)
+        x1, y1 = min(w_img, fx + fw), min(h_img, fy + fh)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        roi = gray[y0:y1, x0:x1]
+        if roi.size == 0:
+            continue
+        eyes = ec.detectMultiScale(roi, scaleFactor=1.1, minNeighbors=4,
+                                  minSize=(max(8, fw // 8),) * 2)
+        for ex, ey, ew, eh in eyes[:4]:
+            left, top = max(x0, x0+int(ex)), max(y0, y0+int(ey))
+            right, bottom = min(x1, x0+int(ex+ew)), min(y1, y0+int(ey+eh))
+            if right > left and bottom > top:
+                rois.append((left, top, right-left, bottom-top))
+    return rois
+
+
 def brighten_eyes(img: np.ndarray, faces: list,
                   eye_boxes: list[tuple[int, int, int, int]] | None = None) -> np.ndarray:
     """眼部提亮 + 锐化。优先用关键点定位的 eye_boxes；否则退回 Haar 眼睛级联。"""
     if not faces:
         return img
-    if eye_boxes:
-        rois = [(max(0, x), max(0, y), w, h) for (x, y, w, h) in eye_boxes]
-    else:
-        ec = _eye_cascade()
-        if ec is None:
-            return img
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        h_img, w_img = gray.shape
-        rois = []
-        for (fx, fy, fw, fh) in faces:
-            x0, y0 = max(0, fx), max(0, fy)
-            x1, y1 = min(w_img, fx + fw), min(h_img, fy + fh)
-            roi = gray[y0:y1, x0:x1]
-            if roi.size == 0:
-                continue
-            eyes = ec.detectMultiScale(roi, scaleFactor=1.1, minNeighbors=4,
-                                       minSize=(max(8, fw // 8),) * 2)
-            rois.extend((x0 + ex, y0 + ey, ew, eh) for (ex, ey, ew, eh) in eyes[:4])
+    rois = ([(max(0, x), max(0, y), w, h) for (x, y, w, h) in eye_boxes]
+            if eye_boxes is not None else _detect_eye_regions(img, faces))
 
     out = img.copy()
     for (gx0, gy0, ew, eh) in rois:
@@ -342,25 +435,44 @@ def _blend(src: np.ndarray, dst: np.ndarray, strength: float) -> np.ndarray:
 # ------------------------------------------------------------ 主入口
 
 def polish_image(img: np.ndarray, params: PolishParams | None = None,
-                 faces: list[FaceInfo] | list | None = None) -> np.ndarray:
+                 faces: list[FaceInfo] | list | None = None,
+                 warnings: list[str] | None = None,
+                 region_masks: list[np.ndarray] | None = None) -> np.ndarray:
     """美化主流程。faces 允许外部传入 FaceInfo 列表（避免重复检测），缺省自动检测。
 
     顺序：白平衡 → 清晰度 → 磨皮 → 眼部。
     清晰度放在磨皮之前：先建立整体通透感，磨皮再压掉皮肤上的高频噪声，
     避免锐化把刚磨平的皮肤重新"打毛"。
     有 FaceMesh 关键点时用精确皮肤掩码（避开眉眼唇），否则退回 Haar+肤色范围。
+    region_masks 可接收本次已计算的局部过滤蒙版，供预览叠层复用。
     """
     p = params or PolishParams()
     out = auto_white_balance(img, p.wb)
     if p.auto_tone:
         out = auto_tone(out)
+    out = adjust_tone(out, exposure=p.exposure, contrast=p.contrast,
+                      highlights=p.highlights, shadows=p.shadows,
+                      temperature=p.temperature, saturation=p.saturation)
 
     if faces is None:
         from .face_analysis import analyze_faces
         faces = analyze_faces(out)
     face_infos = [f for f in faces if isinstance(f, FaceInfo)]
     boxes = [f.box if isinstance(f, FaceInfo) else tuple(f) for f in faces]
-    local = _local_mask(out, faces, p.local_region)
+    eboxes = None
+    if boxes and p.local_region == 'eyes':
+        eboxes = (eye_regions(face_infos) if face_infos and any(f.mesh for f in face_infos)
+                  else _detect_eye_regions(out, boxes))
+    local = _local_mask(out, faces, p.local_region, eye_boxes=eboxes)
+    if region_masks is not None:
+        region_masks.append(local)
+    if warnings is not None:
+        if p.local_region in {'face', 'skin', 'eyes'} and not np.any(local):
+            label = {'face': '人脸', 'skin': '皮肤', 'eyes': '眼睛'}[p.local_region]
+            reason = '未检测到人脸' if not boxes else f'未找到可用的{label}区域'
+            warnings.append(f'{reason}：{label}局部修复未应用。请选择全图或其他区域；曝光、白平衡和追色仍作用于全图。')
+        elif not boxes and (p.face_repair > 0 or p.blemish > 0):
+            warnings.append('未检测到人脸：人脸修复和瑕疵修复未应用；其他调节仍可使用。')
 
     if p.clarity > 0:
         out = _masked_mix(out, clarity(out, p.clarity), local)
@@ -390,6 +502,7 @@ def polish_image(img: np.ndarray, params: PolishParams | None = None,
         out = repair_face(out, face_area * local, p.face_repair)
 
     if p.eyes and boxes and p.local_region not in {"background", "背景", "skin", "皮肤"}:
-        eboxes = eye_regions(face_infos) if face_infos and any(f.mesh for f in face_infos) else None
+        if eboxes is None and face_infos and any(f.mesh for f in face_infos):
+            eboxes = eye_regions(face_infos) or None
         out = brighten_eyes(out, boxes, eye_boxes=eboxes)
     return out

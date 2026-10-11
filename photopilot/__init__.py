@@ -19,6 +19,7 @@ from .face_analysis import (analyze_faces, FaceInfo, scale_faces,
                             face_region_mask, eye_region_mask)
 from .pipeline import run_pipeline
 from . import pipeline
+from . import platform
 
 __all__ = [
     "load_image", "save_image", "resize_max", "iter_images", "RAW_EXTS", "IMG_EXTS",

@@ -68,7 +68,7 @@ def build(dest: Path) -> Path:
         "LSMinimumSystemVersion": "11.0",
         "NSHighResolutionCapable": True,
         "LSApplicationCategoryType": "public.app-category.photography",
-        "NSHumanReadableCopyright": "MIT License",
+        "NSHumanReadableCopyright": "PhotoPilot — third-party notices: docs/COMMERCIAL_USE.md",
     }
     (app / "Contents" / "Info.plist").write_bytes(
         plistlib.dumps(info, fmt=plistlib.FMT_XML))

@@ -391,8 +391,8 @@ def main():
           "updateStats" in S.INDEX_HTML
           and "已选" in S.INDEX_HTML)
     check("精扫更新保留照片对象",
-          "ranked[i]={...u,thumb:ranked[i].thumb}" in S.INDEX_HTML
-          and "ranked[i]=u|" not in S.INDEX_HTML)
+          "libraryByPath.get(incoming.path)" in S.INDEX_HTML
+          and "Object.assign(photo,incoming)" in S.INDEX_HTML)
     update_card_src = S.INDEX_HTML.split("function updateCardInPlace", 1)[1].split("function cardFor", 1)[0]
     check("评分精扫按线性复杂度更新图库", "updateStats();" not in update_card_src
           and "ranked.reduce" in S.INDEX_HTML)
@@ -533,8 +533,12 @@ def main():
           "targetBtn" in S.INDEX_HTML and "targetPath" in S.INDEX_HTML
           and "请选择一张目标照片" in S.INDEX_HTML)
     from photopilot.xmp import write_sidecar as _ws
-    _x = _ws(target, 0.9, ["通过"], rating=None)   # 缺省路径仍按分数自动映射
-    check("write_sidecar 缺省自动映射不回归",
+    _x = _ws(target, 0.9, ["通过"], rating=None)
+    check("自动评分尊重人工清除星级",
+          read_rating(target) == 0)
+    xmp_before.unlink(missing_ok=True)
+    _x = _ws(target, 0.9, ["通过"], rating=None)   # 新 sidecar 仍按分数自动映射
+    check("无人工评级时缺省自动映射不回归",
           "<xmp:Rating>5</xmp:Rating>" in _x.read_text() and "<xmp:Label>Keeper</xmp:Label>" in _x.read_text())
     xmp_before.unlink(missing_ok=True)
 
@@ -693,7 +697,7 @@ def main():
         try:
             def fake_scan(payload):
                 captured["payload"] = payload
-                return {"job": "overlap-import"}
+                return {"job": "overlap-import", "folder": payload["folder"]}
             S._scan_start = fake_scan
             S.UPLOAD_ROOTS = [root / "uploads"]
             imported = S._import_paths({"paths": [str(root), str(child)], "recursive": True})
@@ -786,11 +790,15 @@ def main():
         S.SCAN_JOBS.update(saved_scan_jobs)
 
     # 大批量处理不能静默丢掉第 501 张；选择状态也必须独立于当前已渲染 DOM。
-    many_paths = [str(process_src)] * 501
+    many_paths = [str(process_out / f"large-batch-{i}.jpg") for i in range(501)]
     many_prep = S._prepare({"folder": str(process_out), "paths": many_paths,
                             "operation": "polish"})
     many_session = S._SESSIONS.get(many_prep["sid"], {})
     check("大批量处理不静默截断", len(many_session.get("paths", [])) == 501)
+    dedup_prep = S._prepare({"folder": str(process_out), "paths": [str(process_src)] * 501,
+                            "operation": "polish"})
+    check("重复选择同一照片只处理一次", dedup_prep["count"] == 1)
+    S._SESSIONS.pop(dedup_prep["sid"], None)
     S._SESSIONS.pop(many_prep["sid"], None)
     check("大图库选择状态不依赖 DOM",
           "selectedPaths" in S.INDEX_HTML
@@ -875,7 +883,7 @@ def main():
         try:
             def fake_scan(payload):
                 captured["payload"] = payload
-                return {"job": "regression-multi"}
+                return {"job": "regression-multi", "folder": payload["folder"]}
             S._scan_start = fake_scan
             S.UPLOAD_ROOTS = [multi_dir / "uploads"]
             multi = S._import_paths({"paths": [str(ts_dir), str(multi_dir)]})
@@ -941,11 +949,12 @@ def main():
           "-psn_*)" in launcher_template and '"${{args[@]}}"' in launcher_template
           and "/usr/bin/arch -arm64" in launcher_template)
     egg_info = (ROOT / "photopilot.egg-info" / "PKG-INFO")
-    egg_match = re.search(r'^Version:\s*([^\n]+)', egg_info.read_text(encoding="utf-8"), re.M)
+    egg_match = (re.search(r'^Version:\s*([^\n]+)', egg_info.read_text(encoding="utf-8"), re.M)
+                 if egg_info.exists() else None)
     egg_version = egg_match.group(1).strip() if egg_match else None
     check("项目版本元数据一致",
           init_version == project_version and build_versions == {project_version}
-          and egg_version == project_version,
+          and (not egg_info.exists() or egg_version == project_version),
           f"project={project_version}, init={init_version}, app={sorted(build_versions)}, egg={egg_version}")
 
     app_plist = Path("/Applications/PhotoPilot.app/Contents/Info.plist")

@@ -144,7 +144,8 @@ def load_image(path: str | Path, max_size: int | None = 2048,
                         rgb = raw.postprocess(use_camera_wb=True, half_size=True,
                                               no_auto_bright=False, output_bps=8)
                 else:
-                    rgb = raw.postprocess(use_camera_wb=True, half_size=True,
+                    rgb = raw.postprocess(use_camera_wb=True,
+                                          half_size=max_size is not None and max_size <= 2560,
                                           no_auto_bright=False, output_bps=8)
     else:
         with Image.open(path) as im:
@@ -173,9 +174,13 @@ def iter_images(folder: str | Path, recursive: bool = False) -> Iterator[Path]:
     """遍历目录下的受支持图片（默认不递归，跳过隐藏文件）。"""
     folder = Path(folder)
     if folder.is_file():
-        yield folder
+        if is_image(folder):
+            yield folder
         return
     pattern = "**/*" if recursive else "*"
     for p in sorted(folder.glob(pattern)):
-        if p.is_file() and not p.name.startswith(".") and is_image(p):
+        relative = p.relative_to(folder)
+        if (p.is_file() and is_image(p)
+                and not any(part.startswith('.') for part in relative.parts)
+                and 'photopilot_out' not in relative.parts[:-1]):
             yield p

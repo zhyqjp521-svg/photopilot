@@ -1,0 +1,55 @@
+# 在 GitHub 云端（Windows 机器）自动构建 Windows x64 单文件程序。
+#
+# 触发方式：
+#   - 推送到 main 分支自动触发
+#   - 或在 GitHub 仓库页面 Actions 标签里手动 "Run workflow"
+#
+# 产物：Actions 运行详情页最下方 Artifacts 里的
+#      PhotoPilot-windows-x64.zip（内含 PhotoPilot.exe，双击即用，免装 Python）
+
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11 (x64)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pyinstaller
+
+      - name: Verify package imports
+        run: python -c "import photopilot; print('PhotoPilot', photopilot.__version__)"
+
+      - name: Build PhotoPilot.exe
+        run: python scripts/build_windows.py
+
+      - name: Show output
+        run: dir dist
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhotoPilot-windows-x64
+          path: dist/PhotoPilot.exe
+          if-no-files-found: error
+          retention-days: 30

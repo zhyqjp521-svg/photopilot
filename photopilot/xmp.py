@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-import re
+import os
+import tempfile
+import threading
+import xml.etree.ElementTree as ET
 
 from . import __version__
 
@@ -32,6 +35,32 @@ TEMPLATE = """<?xpacket begin="\\uFEFF" id="W5M0MpCehiHzreSzNTczkc9d"?>
 
 # 星级映射：与主流修图软件的"星标挑片"习惯对齐
 LABEL_KEEP, LABEL_REVIEW, LABEL_REJECT = "Keeper", "Review", "Reject"
+XMP_NS = "http://ns.adobe.com/xap/1.0/"
+RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+PP_NS = "http://photopilot.local/ns/1.0/"
+for _prefix, _uri in (("x", "adobe:ns:meta/"), ("rdf", RDF_NS),
+                      ("xmp", XMP_NS), ("photoPilot", PP_NS)):
+    ET.register_namespace(_prefix, _uri)
+_WRITE_LOCK = threading.RLock()
+
+
+def _property(root: ET.Element, ns: str, name: str) -> str | None:
+    tag = f"{{{ns}}}{name}"
+    for node in root.iter():
+        if tag in node.attrib:
+            return node.attrib[tag]
+        if node.tag == tag:
+            return node.text
+    return None
+
+
+def _rating(root: ET.Element) -> int | None:
+    value = _property(root, XMP_NS, "Rating")
+    try:
+        rating = int(value)
+        return rating if 0 <= rating <= 5 else None
+    except (TypeError, ValueError):
+        return None
 
 
 def rating_for(score: float) -> int:
@@ -46,18 +75,19 @@ def rating_for(score: float) -> int:
     return 1
 
 
-def read_rating(image_path: str | Path) -> int | None:
-    """读取同名 XMP 的手动星级；不存在或内容损坏时返回 ``None``。
+def read_rating(image_path: str | Path, *, manual_only: bool = False) -> int | None:
+    """读取同名 XMP 星级；不存在或内容损坏时返回 ``None``。
 
-    只读取 PhotoPilot/Lightroom 约定的整数 Rating，不会把自动综合分当作
-    用户星级，从而允许 UI 在重扫后继续按上次人工筛选结果过滤。
+    manual_only 用于 UI 收藏筛选，排除明确标记为 PhotoPilot 自动映射的
+    星级；没有此标记的外部软件 XMP 按人工评级处理。
     """
     xmp_path = Path(image_path).with_suffix(".xmp")
     try:
-        text = xmp_path.read_text(encoding="utf-8")
-        m = re.search(r"<xmp:Rating>\s*([0-5])\s*</xmp:Rating>", text)
-        return int(m.group(1)) if m else None
-    except (OSError, UnicodeError):
+        root = ET.parse(xmp_path).getroot()
+        if manual_only and _property(root, PP_NS, "manualRating") == "false":
+            return None
+        return _rating(root)
+    except (OSError, UnicodeError, ET.ParseError):
         return None
 
 
@@ -79,14 +109,59 @@ def write_sidecar(image_path: str | Path, score: float, flags: list[str],
     """
     src = Path(image_path)
     xmp_path = src.with_suffix(".xmp")
-    r = rating_for(score) if rating is None else max(0, min(5, int(rating)))
-    if label is None:
-        label = label_for(score) if rating is None else (
-            LABEL_KEEP if r >= 4 else LABEL_REVIEW if r >= 2 else LABEL_REJECT)
-    xml = TEMPLATE.format(
-        rating=r, label=label, score=f"{score:.4f}",
-        sharpness=f"{sharpness:.4f}", exposure=f"{exposure:.4f}", faces=faces,
-        flags=";".join(flags), version=__version__,
-    )
-    xmp_path.write_text(xml, encoding="utf-8")
+    # Merge rather than replace: a sidecar may contain an entire Lightroom edit.
+    with _WRITE_LOCK:
+        if xmp_path.exists():
+            try:
+                parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+                root = ET.parse(xmp_path, parser=parser).getroot()
+            except (ET.ParseError, UnicodeError) as exc:
+                raise ValueError("现有 XMP 无法解析，已保留原文件；请先修复或备份它") from exc
+        else:
+            root = ET.Element("{adobe:ns:meta/}xmpmeta")
+            rdf = ET.SubElement(root, f"{{{RDF_NS}}}RDF")
+            ET.SubElement(rdf, f"{{{RDF_NS}}}Description", {f"{{{RDF_NS}}}about": ""})
+        desc = root.find(f".//{{{RDF_NS}}}Description")
+        if desc is None:
+            raise ValueError("现有 XMP 缺少 RDF Description，已保留原文件")
+        old_rating = _rating(root)
+        manual = rating is not None or (old_rating is not None
+                    and _property(root, PP_NS, "manualRating") != "false")
+        r = (max(0, min(5, int(rating))) if rating is not None else
+             old_rating if manual else rating_for(score))
+        if label is None:
+            label = (_property(root, XMP_NS, "Label") if rating is None and manual else None)
+            label = label or (LABEL_KEEP if r >= 4 else LABEL_REVIEW if r >= 2 else LABEL_REJECT)
+        values = {
+            (XMP_NS, "Rating"): str(r), (XMP_NS, "Label"): label,
+            (PP_NS, "score"): f"{score:.4f}",
+            (PP_NS, "sharpness"): f"{sharpness:.4f}",
+            (PP_NS, "exposure"): f"{exposure:.4f}",
+            (PP_NS, "faces"): str(faces), (PP_NS, "flags"): ";".join(flags),
+            (PP_NS, "software"): f"PhotoPilot {__version__}",
+            (PP_NS, "manualRating"): "true" if manual else "false",
+        }
+        for (ns, name), value in values.items():
+            tag = f"{{{ns}}}{name}"
+            for node in root.iter():
+                node.attrib.pop(tag, None)
+                for child in list(node):
+                    if child.tag == tag:
+                        node.remove(child)
+            ET.SubElement(desc, tag).text = value
+        data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=xmp_path.parent, prefix=f".{xmp_path.name}.",
+                                             suffix=".tmp", delete=False) as handle:
+                temporary = Path(handle.name)
+                if xmp_path.exists():
+                    os.fchmod(handle.fileno(), xmp_path.stat().st_mode & 0o777)
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, xmp_path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
     return xmp_path

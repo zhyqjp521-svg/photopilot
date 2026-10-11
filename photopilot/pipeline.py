@@ -119,13 +119,20 @@ def run_pipeline(input_dir: str | Path,
     print(f"      共 {len(report.photos)} 张，入选 {len(keepers)} 张")
 
     print("[2/4] 解析追色参考 …")
-    works = {k.path: load_image(k.path, max_size=WORK_SIZE) for k in keepers}
+    # Retain only tiny per-image statistics, never an entire decoded library.
+    # Batch size now affects metadata memory, not N × 1024px RGB buffers.
+    gains, stats = {}, {}
+    if wb_mode == 'batch':
+        from .polish import estimate_wb_gains
+        for keeper in keepers:
+            work = load_image(keeper.path, max_size=WORK_SIZE)
+            gains[keeper.path] = estimate_wb_gains(work)
+        del work
 
     # 白平衡：single=逐张（polish 内做）；batch=整批统一（追色前先校正）
     wb_corr: dict[str, np.ndarray] = {}
     if wb_mode == "batch":
         from .polish import estimate_wb_gains, batch_target_gains, apply_wb_gains
-        gains = {k.path: estimate_wb_gains(w) for k, w in works.items()}
         target = batch_target_gains(list(gains.values()))
         wb_corr = {k: target / g for k, g in gains.items()}
         p = dataclasses_replace(p, wb=0.0)   # polish 内单张 WB 让位
@@ -133,23 +140,40 @@ def run_pipeline(input_dir: str | Path,
     elif wb_mode == "off":
         p = dataclasses_replace(p, wb=0.0)
 
+    if not ref and not preset:
+        # Auto/scene references must describe the WB-corrected input, as in the
+        # original pipeline; keeping only stats must not change color semantics.
+        for keeper in keepers:
+            work = load_image(keeper.path, max_size=WORK_SIZE)
+            if keeper.path in wb_corr:
+                work = apply_wb_gains(work, wb_corr[keeper.path], .95)
+            stats[keeper.path] = oklab_stats(work)
+        del work
+
     scene_groups = None
     if scene_ref and not ref and not preset and len(keepers) >= 4:
         # 多参考追色：按 OKLab 均值聚类（≤4 簇），每簇内部独立求参考
         from .color import oklab_stats as _ost, cluster_scenes, reference_from_stats as _rfs
-        mus = np.stack([_ost(works[k.path])[0] for k in keepers])
+        mus = np.stack([stats[k.path][0] for k in keepers])
         labels, centers = cluster_scenes(mus, k=min(4, max(2, len(keepers) // 3)))
         scene_groups = []            # (member_paths, ColorReference)
         for j in range(len(centers)):
             mem = [k.path for k, lb in zip(keepers, labels) if lb == j]
             if not mem:
                 continue
-            m_mus, m_sds = zip(*(_ost(works[p]) for p in mem))
+            m_mus, m_sds = zip(*(stats[path] for path in mem))
             scene_groups.append((mem, _rfs(np.mean(m_mus, 0), np.mean(m_sds, 0))))
         ref_desc = f"多参考（{len(scene_groups)} 个场景组）"
         reference = scene_groups[0][1] if scene_groups else None   # 兜底：组外的照片
     else:
-        reference, ref_desc = _resolve_reference(ref, preset, [works[k.path] for k in keepers])
+        if ref:
+            reference, ref_desc = reference_from_image(ref), '参考图'
+        elif preset:
+            reference, ref_desc = reference_from_preset(preset), f'预设 {preset}'
+        else:
+            mus, sds = zip(*stats.values())
+            reference = reference_from_stats(np.mean(mus, axis=0), np.mean(sds, axis=0))
+            ref_desc = 'auto（本批平均色调）'
     print(f"      参考来源：{ref_desc}，算法：{algo}")
 
     print("[3/4] 追色 + 美化 + 导出 …")
@@ -159,38 +183,21 @@ def run_pipeline(input_dir: str | Path,
         (k.path for k in keepers), preserve_raster=True)
 
     for i, k in enumerate(keepers, 1):
-        work = works[k.path]
-        if k.path in wb_corr:
-            from .polish import apply_wb_gains
-            work = apply_wb_gains(work, wb_corr[k.path], 0.95)
-            works[k.path] = work
-        faces_w = analyze_faces(work)
-        boxes_w = [f.box for f in faces_w]
-        cur_ref = reference
-        if scene_groups:
-            cur_ref = next((r for mem, r in scene_groups if k.path in mem), reference)
-        graded = match_color(work, cur_ref, algo=algo, strength=color_strength,
-                             preserve_luma=preserve_luma, skin_protect=skin_protect,
-                             faces=boxes_w)
-        polished = polish_image(graded, p, faces=faces_w)
-
         src = Path(k.path)
-        # 成品按导出分辨率重新处理：人脸框/关键点一起映射过去
         final_src = load_image(src, max_size=EXPORT_SIZE)
-        scale = final_src.shape[1] / work.shape[1]
         if k.path in wb_corr:
             from .polish import apply_wb_gains
             final_src = apply_wb_gains(final_src, wb_corr[k.path], 0.95)
-        if scale > 1.05:
-            faces_final = scale_faces(faces_w, scale)
-            final_graded = match_color(final_src, cur_ref, algo=algo,
-                                       strength=color_strength,
-                                       preserve_luma=preserve_luma,
-                                       skin_protect=skin_protect,
-                                       faces=[f.box for f in faces_final])
-            final = polish_image(final_graded, p, faces=faces_final)
-        else:
-            final = polished
+        work = resize_max(final_src, WORK_SIZE)
+        faces_w = analyze_faces(work)
+        faces_final = scale_faces(faces_w, final_src.shape[1] / work.shape[1])
+        cur_ref = reference
+        if scene_groups:
+            cur_ref = next((r for mem, r in scene_groups if k.path in mem), reference)
+        graded = match_color(final_src, cur_ref, algo=algo, strength=color_strength,
+                              preserve_luma=preserve_luma, skin_protect=skin_protect,
+                              faces=[f.box for f in faces_final])
+        final = polish_image(graded, p, faces=faces_final)
 
         dst = out / output_names[k.path]
         save_image(final, dst, quality=export_quality)
@@ -198,7 +205,7 @@ def run_pipeline(input_dir: str | Path,
         if write_xmp:
             write_sidecar(src, k.score, k.flags, k.sharpness, k.exposure, k.faces)
         if contact and len(sheet_rows) < 8:
-            sheet_rows.append([work, graded, polished])
+            sheet_rows.append([work, resize_max(graded, WORK_SIZE), resize_max(final, WORK_SIZE)])
         print(f"      [{i}/{len(keepers)}] {src.name}  score={k.score:.2f} → {dst.name}")
 
     if contact and sheet_rows:
