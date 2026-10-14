@@ -18,14 +18,14 @@
 | 7 | 在 Finder 中显示 | ✅ 已实现（`/api/reveal` + 灯箱按钮 + 卡片右键） |
 | 8 | 可撤销局部画笔 | ⬜ 未做（P2 大项） |
 | 9 | 去噪/去模糊后端 | ⬜ 未做（P2 大项） |
-| 10 | 经授权美学模型 | ⬜ 未做（P2，需模型审计） |
+| 10 | 经授权美学模型 | ✅ 已实现（idealo MobileNet Apache-2.0，`--ai` 恢复） |
 | 11 | 灯箱 EXIF 参数面板 | ✅ 已实现（`/api/exif` + `exif_summary()` + 灯箱 `lbExif`） |
 | 12 | 窗口标题随项目更新 | ✅ 已实现 |
 | 13 | 窗口尺寸/位置记忆 | ✅ 已实现（resize 防抖 + 启动恢复） |
 | 14 | 桌面窗口自动化冒烟 | ✅ 已实现（`tests/smoke_desktop.py`，Playwright 真实浏览器） |
 | 15 | i18n | ⬜ 未做（P3 大项，按需） |
 | 附1 | venv 双 OpenCV 清理 | ✅ 已清理（仅留 headless 4.10） |
-| 附2 | git 历史未授权 NIMA 权重 | ⬜ 待授权（`git filter-repo` 重写） |
+| 附2 | git 历史未授权 NIMA 权重 | ✅ 已清除（`git filter-repo` 重写历史） |
 
 ## P0 — Mac 硬伤（真 Bug，建议立即修）
 
@@ -112,6 +112,14 @@
   发布需逐一核对），接入后恢复 `--ai` 与「美学模型」开关。
 - **收益**：筛片准确度显著提升（美学分是智能筛选的核心维度）。
 - **改动范围**：中–大（模型审计 + aesthetic.py 换权重 + 阈值重标定）。
+- **实施（2026-10-14）**：采用 idealo/image-quality-assessment 的 MobileNet 美学
+  权重（**Apache-2.0**，AVA 训练，EMD 0.071 / LCC 0.626 / SRCC 0.609）。经隔离
+  venv（tensorflow 2.21 + tf2onnx）一次性把 Keras .hdf5 转 ONNX
+  （`models/nima_mobilenet_aesthetic_apache.onnx`，12.9MB）；`aesthetic.py` 的
+  `MODEL_LICENSE_VERIFIED=True`，推理改为直接取 softmax 分布的期望分（新模型
+  dense 层已带 softmax，去掉旧的二次 softmax）；预处理 `/127.5-1` 与旧代码等价。
+  前端「美学模型」开关恢复，打包脚本恢复 onnxruntime 收集 + 模型 add-data。
+  旧的未授权权重已从工作区与 git 历史彻底移除。
 
 ### 11. 灯箱显示拍摄参数（EXIF 面板）
 - **现状**：快审灯箱只有分数/星级，看不到光圈、快门、ISO、焦段、机身；

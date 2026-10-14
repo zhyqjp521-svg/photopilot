@@ -121,7 +121,8 @@ onnxruntime、Pillow、rawpy(LibRaw)、pywebview 等全部依赖。
    与 `pyproject.toml` 一致），避免体积膨胀与符号冲突。
 4. **体积**：单文件约 200–400MB（主要是 mediapipe + onnxruntime + opencv），
    首次启动解压到临时目录会稍慢，属 one-file 正常现象。
-5. **旧 NIMA 权重**：源码分发不含未授权权重，exe 同样不内置，`--ai` 会回退传统指标。
+5. **美学模型权重**：采用 idealo/image-quality-assessment 的 MobileNet 美学权重
+   （Apache-2.0），转 ONNX 后经 `--add-data` 内置到 exe（约 12.9MB），`--ai` 可用。
 6. **send2trash**：Windows/Linux 回收站依赖 `send2trash`（`pyproject.toml` 已按平台声明，
    macOS 不装）。脚本已带 `--collect-submodules send2trash`，缺失时删除原片会提示"缺少 send2trash"。
 
