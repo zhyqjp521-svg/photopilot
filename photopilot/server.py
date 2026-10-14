@@ -20,9 +20,12 @@
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import errno
 import hashlib
 import html
+import io
 import json
 import math
 import os
@@ -703,6 +706,30 @@ def _prepare(payload: dict, *, retain_session=True) -> dict:
     return {"sid": sid, "ref_desc": ses["ref_desc"], "count": len(paths)}
 
 
+def _decode_brush_mask(raw) -> np.ndarray:
+    """把前端手刷掩码解码为 0–1 灰度数组（与原图分辨率无关，后端统一 resize）。
+
+    接受 base64 字符串（可带 `data:image/png;base64,` 前缀）编码的灰度 PNG。
+    解码失败或格式异常时抛 ValueError，由上层按参数错误处理。
+    """
+    if raw is None:
+        raise ValueError("画笔掩码缺失")
+    if not isinstance(raw, str) or not raw or len(raw) > 8 * 1024 * 1024:
+        raise ValueError("画笔掩码无效")
+    payload = raw.split(",", 1)[-1] if "," in raw else raw
+    try:
+        data = base64.b64decode(payload, validate=False)
+    except (ValueError, binascii.Error):
+        raise ValueError("画笔掩码编码无效")
+    try:
+        arr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE)
+    except cv2.error:
+        raise ValueError("画笔掩码解码失败")
+    if arr is None or arr.size == 0:
+        raise ValueError("画笔掩码解码失败")
+    return arr.astype(np.float32) / 255.0
+
+
 def _process_one(payload: dict) -> dict:
     ses = _SESSIONS.get(payload.get("sid", ""))
     if ses is None:
@@ -718,13 +745,16 @@ def _render_session(ses: dict, payload: dict, *, output_destination=None) -> dic
     if not isinstance(adjustments, dict) or set(adjustments) - tone_keys:
         raise ValueError("未知调色参数")
     retouch = payload.get("retouch_adjustments", {})
-    retouch_keys = {'skin', 'retain', 'clarity', 'face_repair', 'blemish', 'local_region'}
+    retouch_keys = {'skin', 'retain', 'clarity', 'face_repair', 'blemish', 'local_region', 'brush_mask'}
     if not isinstance(retouch, dict) or set(retouch) - retouch_keys:
         raise ValueError("未知精修参数")
+    brush_mask = None
     for key, value in retouch.items():
         if key == 'local_region':
-            if not isinstance(value, str) or value not in {'all', 'skin', 'face', 'eyes', 'background'}:
+            if not isinstance(value, str) or value not in {'all', 'skin', 'face', 'eyes', 'background', 'brush'}:
                 raise ValueError("未知局部区域")
+        elif key == 'brush_mask':
+            brush_mask = _decode_brush_mask(value) if value else None
         elif (isinstance(value, bool) or not isinstance(value, (int, float))
               or not 0 <= value <= 1):
             raise ValueError(f"{key} 需为 0 到 1 之间的有限数值")
@@ -732,8 +762,9 @@ def _render_session(ses: dict, payload: dict, *, output_destination=None) -> dic
     if not isinstance(show_mask, bool):
         raise ValueError("show_mask 必须为布尔值")
     try:
+        retouch_params = {k: v for k, v in retouch.items() if k != 'brush_mask'}
         params = replace(ses['params'], **{key: float(value) for key, value in adjustments.items()},
-                         **retouch)
+                         **retouch_params)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("无效的调整参数") from exc
     path = Path(payload["path"])
@@ -786,6 +817,8 @@ def _render_session(ses: dict, payload: dict, *, output_destination=None) -> dic
                               faces=[f.box for f in faces_f]) if do_color and cur_ref is not None else full)
         warnings = []
         mask_options = {'region_masks': region_masks} if region_masks is not None else {}
+        if brush_mask is not None:
+            mask_options['brush_mask'] = brush_mask
         final = polish_image(graded, params, faces=faces_f, warnings=warnings,
                              **mask_options) if do_polish else graded
 
@@ -1597,6 +1630,12 @@ input[type=range]::-webkit-slider-thumb:active{cursor:grabbing;transform:scale(1
 .editorMaskToggle input{width:auto}
 .cmp img.region-mask{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;pointer-events:none}
 .cmp img.region-mask[hidden]{display:none}
+.cmp canvas.brush-canvas{position:absolute;left:0;top:0;pointer-events:auto;cursor:crosshair;touch-action:none;z-index:3}
+.cmp canvas.brush-canvas[hidden]{display:none}
+.cmp.brush-active{cursor:crosshair}
+.brushActions{display:flex;gap:6px;margin:8px 0}
+.brushActions .btn{flex:1;margin:0;padding:7px 4px;font-size:12px}
+.brushActions .btn.on{background:var(--acc);color:#fff}
 .editorTools h3{margin:0 0 16px;font-size:15px}
 .editorTools .btn{width:100%;margin-top:10px}
 .editorHistory{display:flex;gap:8px;margin-bottom:16px}
@@ -3048,9 +3087,9 @@ const TONE_CONTROLS=[
   ['temperature','冷暖',-1,1,.05],['saturation','饱和度',-1,1,.05]
 ];
 const RETOUCH_CONTROLS=[['skin','磨皮'],['retain','纹理保留'],['clarity','清晰度'],['face_repair','人脸修复'],['blemish','瑕疵修复']];
-const RETOUCH_KEYS=[...RETOUCH_CONTROLS.map(([key])=>key),'local_region'];
-const RETOUCH_REGIONS=['all','skin','face','eyes','background'];
-function retouchValues(){return {...Object.fromEntries(RETOUCH_CONTROLS.map(([key])=>[key,+$('edit-retouch-'+key).value])),local_region:$('editRegion').value};}
+const RETOUCH_KEYS=[...RETOUCH_CONTROLS.map(([key])=>key),'local_region','brush_mask'];
+const RETOUCH_REGIONS=['all','skin','face','eyes','background','brush'];
+function retouchValues(){return {...Object.fromEntries(RETOUCH_CONTROLS.map(([key])=>[key,+$('edit-retouch-'+key).value])),local_region:$('editRegion').value,brush_mask:CURRENT_EDITOR?.brushMask??null};}
 function bindEditorGesture(input){
   input.onpointerdown=()=>beginEditorGesture('pointer');
   input.onkeydown=e=>{if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End','PageUp','PageDown'].includes(e.key))beginEditorGesture('keyboard');};
@@ -3154,7 +3193,8 @@ function sameTone(a,b){return TONE_CONTROLS.every(([key])=>a[key]===b[key]);}
 function validRetouch(value){
   return value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).length===RETOUCH_KEYS.length
     &&RETOUCH_CONTROLS.every(([key])=>typeof value[key]==='number'&&Number.isFinite(value[key])&&value[key]>=0&&value[key]<=1)
-    &&RETOUCH_REGIONS.includes(value.local_region);
+    &&RETOUCH_REGIONS.includes(value.local_region)
+    &&(value.brush_mask===null||(typeof value.brush_mask==='string'&&value.brush_mask.length<8*1024*1024));
 }
 function sameRetouch(a,b){return RETOUCH_KEYS.every(key=>a[key]===b[key]);}
 function sameEditorState(editor,tone,retouch){return sameTone(editor.tone,tone)&&sameRetouch(editor.retouch,retouch);}
@@ -3193,6 +3233,7 @@ function syncEditorTone(editor){
 function syncEditorRetouch(editor){
   for(const [key] of RETOUCH_CONTROLS){const input=$('edit-retouch-'+key);input.value=editor.retouch[key];slide(input,'edit-retouch-'+key+'-value');}
   $('editRegion').value=editor.retouch.local_region;
+  syncBrushUI();
 }
 function beginEditorGesture(kind=null){
   const editor=CURRENT_EDITOR;if(!editor||editor.operation==='color'||editor.exporting)return;
@@ -3225,7 +3266,7 @@ function moveEditorHistory(delta){
   const editor=CURRENT_EDITOR;if(!editor||editor.operation==='color'||editor.exporting)return;
   flushEditorGesture();
   const index=editor.index+delta;if(index<0||index>=editor.history.length)return;
-  editor.index=index;editor.tone={...editor.history[index]};editor.retouch={...editor.retouchHistory[index]};syncEditorTone(editor);syncEditorRetouch(editor);
+  editor.index=index;editor.tone={...editor.history[index]};editor.retouch={...editor.retouchHistory[index]};editor.brushMask=editor.retouch.brush_mask??null;syncEditorTone(editor);syncEditorRetouch(editor);
   editor.revision++;hideEditorMask(editor);persistEditorDraft(editor);updateEditorHistory();scheduleEditorPreview(editor);projectChanged();
 }
 function undoEditorTone(){moveEditorHistory(-1);}
@@ -3277,7 +3318,7 @@ async function process(operation,retryPaths=null){
       export_size:$('exportSize').value,export_quality:+$('exportQuality').value,polish};
     const signature=editorBaseSignature(settings),single=sel.length===1;
     if(!single){await submitExportQueue(settings);return;}
-    const openingRetouch=Object.fromEntries(RETOUCH_KEYS.map(key=>[key,polish[key]]));
+    const openingRetouch=Object.fromEntries(RETOUCH_KEYS.map(key=>[key,key==='brush_mask'?null:polish[key]]));
     const draft=single&&operation!=='color'?editorDraft(sel[0],operation,signature,openingRetouch):null;
     const initialTone=draft?.tone||toneValues();
     const initialRetouch=draft?.retouch||openingRetouch;
@@ -3299,7 +3340,13 @@ async function process(operation,retryPaths=null){
             <div id="editTonePanel" role="tabpanel" aria-labelledby="editToneTab"><div id="editToneControls"></div>
             <button class="btn ghost" id="editReset" type="button" onclick="resetEditorTone()">重置调色</button></div>
             ${operation!=='color'?`<div id="editPortraitControls" role="tabpanel" aria-labelledby="editPortraitTab" hidden>
-              <div id="editRetouchSliders"></div><div class="row"><label for="editRegion">局部区域</label><select id="editRegion"><option value="all">全图</option><option value="skin">肤色区域</option><option value="face">人脸区域</option><option value="eyes">眼周区域</option><option value="background">背景区域</option></select></div>
+              <div id="editRetouchSliders"></div><div class="row"><label for="editRegion">局部区域</label><select id="editRegion"><option value="all">全图</option><option value="skin">肤色区域</option><option value="face">人脸区域</option><option value="eyes">眼周区域</option><option value="background">背景区域</option><option value="brush">画笔区域</option></select></div>
+              <div id="editBrushControls" hidden>
+                <div class="row"><label>画笔大小 <span class="val" id="editBrushSize-value">60</span></label><input type="range" id="editBrushSize" min="8" max="300" step="2" value="60" oninput="slide(this,'editBrushSize-value')"></div>
+                <div class="row"><label>羽化 <span class="val" id="editBrushFeather-value">0.5</span></label><input type="range" id="editBrushFeather" min="0" max="1" step="0.05" value="0.5" oninput="slide(this,'editBrushFeather-value')"></div>
+                <div class="brushActions"><button class="btn ghost" id="editBrushPaint" type="button" onclick="setBrushMode('paint')">画笔</button><button class="btn ghost" id="editBrushErase" type="button" onclick="setBrushMode('erase')">橡皮擦</button><button class="btn ghost" id="editBrushClear" type="button" onclick="clearBrushMask()">清除</button></div>
+                <div class="subhint">在左侧预览图上按住拖动即可手刷区域；仅作用清晰度/磨皮/修复，曝光白平衡与追色仍作用于全图。</div>
+              </div>
               <label class="editorMaskToggle" title="蓝色仅表示区域范围；磨皮/修脸还受人脸和肤色识别限制；不会导出"><input id="editMask" type="checkbox" aria-describedby="editMaskHelp">显示区域蒙版</label>
               <div class="subhint" id="editMaskHelp">蓝色仅表示区域范围；磨皮/修脸还受人脸和肤色识别限制；不会导出</div>
               <button class="btn ghost" id="editRetouchReset" type="button" onclick="resetEditorRetouch()">恢复人像参数</button></div>`:''}
@@ -3322,6 +3369,7 @@ async function process(operation,retryPaths=null){
         const pair=document.createElement('div');pair.className='pair';
         pair.innerHTML=`<div class="cmp"><img alt="原始照片" src="${escapeHtml(r.before)}"><img alt="编辑预览" class="b" src="${escapeHtml(r.after)}">
           ${single&&operation!=='color'?'<img id="editRegionMask" alt="区域范围蒙版" class="region-mask" hidden>':''}
+          ${single&&operation!=='color'?'<canvas id="editBrushCanvas" class="brush-canvas" hidden></canvas>':''}
           <div class="bar"></div><div class="knob">◄►</div>
           <span class="tag l">原始</span><span class="tag r">成品</span></div>
           <div class="name" style="padding:8px 4px 0">${escapeHtml(p.split('/').pop())}</div>`;
@@ -3331,7 +3379,7 @@ async function process(operation,retryPaths=null){
           CURRENT_EDITOR={sid:prep.sid,path:p,revision:0,renderEpoch:0,busy:false,previewPending:false,exporting:false,operation,
             settings,baseSignature:signature,tone:{...initialTone},history:draft?.history||[{...initialTone}],
             initialRetouch:{...openingRetouch},retouch:{...initialRetouch},retouchHistory:draft?.retouchHistory||[{...initialRetouch}],
-            index:draft?.index||0,gesture:null,showMask:false,maskFrame:null};
+            index:draft?.index||0,gesture:null,showMask:false,maskFrame:null,brushMask:null};
           if(operation!=='color'){
             buildToneControls($('editToneControls'),'edit-',initialTone,queueEditorPreview);
             buildRetouchControls(CURRENT_EDITOR);hideEditorMask(CURRENT_EDITOR);
@@ -3360,6 +3408,104 @@ function hideEditorMask(editor){
   if(!editor||editor.operation==='color')return;
   editor.maskFrame=null;$('editRegionMask').hidden=true;
 }
+// ---------- 局部画笔 ----------
+let BRUSH_MODE='paint';       // paint | erase
+function brushCanvas(){return $('editBrushCanvas');}
+function brushModeEl(){return $('editBrushPaint');}
+function brushEraseEl(){return $('editBrushErase');}
+function setBrushMode(mode){
+  BRUSH_MODE=mode;
+  brushModeEl().classList.toggle('on',mode==='paint');
+  brushEraseEl().classList.toggle('on',mode==='erase');
+}
+function brushVisible(){
+  const editor=CURRENT_EDITOR;
+  return !!(editor&&editor.operation!=='color'&&editor.retouch.local_region==='brush');
+}
+function syncBrushUI(){
+  const visible=brushVisible();
+  $('editBrushControls').hidden=!visible;
+  const canvas=brushCanvas();if(canvas)canvas.hidden=!visible;
+  if(visible)setupBrushCanvas();
+}
+function setupBrushCanvas(){
+  const canvas=brushCanvas();if(!canvas)return;
+  const cmp=canvas.closest('.cmp');if(!cmp)return;
+  const img=cmp.querySelector('img.b');
+  // canvas 覆盖在预览图上，尺寸对齐 object-fit:contain 后的实际图片区域，
+  // 保证掩码长宽比与原图一致（后端统一 resize 到原图分辨率，不变形）。
+  const rect=cmp.getBoundingClientRect();
+  if(rect.width<=0||rect.height<=0)return;
+  let dw=rect.width,dh=rect.height,dx=0,dy=0;
+  if(img&&img.naturalWidth>0&&img.naturalHeight>0){
+    const scale=Math.min(rect.width/img.naturalWidth,rect.height/img.naturalHeight);
+    dw=img.naturalWidth*scale;dh=img.naturalHeight*scale;
+    dx=(rect.width-dw)/2;dy=(rect.height-dh)/2;
+  }
+  canvas.style.left=dx+'px';canvas.style.top=dy+'px';
+  canvas.style.width=dw+'px';canvas.style.height=dh+'px';
+  canvas.width=Math.round(dw);canvas.height=Math.round(dh);
+  const ctx=canvas.getContext('2d');
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if(CURRENT_EDITOR&&CURRENT_EDITOR.brushMask){
+    const m=new Image();
+    m.onload=()=>{ctx.drawImage(m,0,0,canvas.width,canvas.height);};
+    m.src=CURRENT_EDITOR.brushMask;
+  }
+  if(canvas._bound)return;
+  canvas._bound=true;
+  let drawing=false,last=null;
+  const pos=e=>{
+    const r=canvas.getBoundingClientRect();
+    return {x:(e.clientX-r.left)*canvas.width/r.width,y:(e.clientY-r.top)*canvas.height/r.height};
+  };
+  const stroke=from=>{
+    if(!last||!from)return;
+    const size=+($('editBrushSize')?.value||60);
+    const feather=+($('editBrushFeather')?.value||0.5);
+    const c=canvas.getContext('2d');
+    c.save();
+    c.globalCompositeOperation=BRUSH_MODE==='erase'?'destination-out':'source-over';
+    c.strokeStyle='rgba(255,255,255,1)';
+    c.lineWidth=size;
+    c.lineCap='round';c.lineJoin='round';
+    c.shadowColor='rgba(255,255,255,1)';
+    c.shadowBlur=size*feather;
+    c.beginPath();c.moveTo(last.x,last.y);c.lineTo(from.x,from.y);c.stroke();
+    c.beginPath();c.arc(from.x,from.y,size/2,0,Math.PI*2);c.fillStyle='rgba(255,255,255,1)';c.fill();
+    c.restore();
+  };
+  canvas.onpointerdown=e=>{
+    if(!brushVisible()||CURRENT_EDITOR?.exporting)return;
+    canvas.setPointerCapture(e.pointerId);drawing=true;last=pos(e);stroke(last);last=pos(e);
+  };
+  canvas.onpointermove=e=>{
+    if(!drawing)return;const p=pos(e);stroke(p);last=p;
+  };
+  const end=()=>{
+    if(!drawing)return;drawing=false;last=null;commitBrushMask();
+  };
+  canvas.onpointerup=canvas.onpointercancel=end;
+}
+function commitBrushMask(){
+  const editor=CURRENT_EDITOR;if(!editor||editor.operation==='color')return;
+  const canvas=brushCanvas();if(!canvas)return;
+  const data=canvas.toDataURL('image/png');
+  editor.brushMask=data;
+  editor.retouch={...editor.retouch,brush_mask:data};
+  editor.revision++;hideEditorMask(editor);
+  if(!editor.gesture)beginEditorGesture();
+  updateEditorHistory();scheduleEditorPreview(editor);projectChanged();
+}
+function clearBrushMask(){
+  const editor=CURRENT_EDITOR;if(!editor||editor.operation==='color')return;
+  const canvas=brushCanvas();
+  if(canvas)canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height);
+  editor.brushMask=null;editor.retouch={...editor.retouch,brush_mask:null};
+  editor.revision++;hideEditorMask(editor);
+  if(!editor.gesture)beginEditorGesture();
+  updateEditorHistory();scheduleEditorPreview(editor);projectChanged();
+}
 function toggleEditorMask(){
   const editor=CURRENT_EDITOR;if(!editor||editor.operation==='color')return;
   if(editor.exporting){$('editMask').checked=editor.showMask;return;}
@@ -3368,6 +3514,12 @@ function toggleEditorMask(){
 function renderEditorFrame(editor,result,revision,epoch){
   const image=$('editStage').querySelector('img.b');
   hideEditorMask(editor);image.onload=null;image.src=result.after;
+  // 画笔层需在图片加载后按其自然尺寸对齐（object-fit:contain 的 letterbox）
+  image.addEventListener('load',function brushSetup(){
+    if(CURRENT_EDITOR!==editor)return;
+    if(brushVisible())setupBrushCanvas();
+  });
+  if(brushVisible())requestAnimationFrame(()=>setupBrushCanvas());
   if(!editor.showMask||typeof result.region_mask!=='string'||!result.region_mask)return;
   // Each detached image belongs to one response, so an old decode can never
   // mark a newer frame as loaded. The displayed image must also finish loading.
@@ -3453,7 +3605,7 @@ function resetEditorTone(){
 function resetEditorRetouch(){
   const editor=CURRENT_EDITOR;if(!editor||editor.operation==='color'||editor.exporting)return;
   flushEditorGesture();beginEditorGesture();
-  editor.retouch={...editor.initialRetouch};syncEditorRetouch(editor);editor.revision++;hideEditorMask(editor);
+  editor.retouch={...editor.initialRetouch};editor.brushMask=editor.retouch.brush_mask??null;syncEditorRetouch(editor);editor.revision++;hideEditorMask(editor);
   flushEditorGesture();scheduleEditorPreview(editor);projectChanged();
 }
 function lockEditorExport(editor){

@@ -16,7 +16,7 @@
 | 5 | 16-bit / TIFF / ICC | ⚠️ 部分（ICC 全接入 + TIFF 保留；16-bit 因管线 uint8 绑定搁置） |
 | 6 | 导出完成通知 + Dock 徽标 | ✅ 已实现 |
 | 7 | 在 Finder 中显示 | ✅ 已实现（`/api/reveal` + 灯箱按钮 + 卡片右键） |
-| 8 | 可撤销局部画笔 | ⬜ 未做（P2 大项） |
+| 8 | 可撤销局部画笔 | ✅ 已实现（`local_region='brush'` + 前端 canvas 笔刷层 + 撤销/重做） |
 | 9 | 去噪/去模糊后端 | ⬜ 未做（P2 大项） |
 | 10 | 经授权美学模型 | ✅ 已实现（idealo MobileNet Apache-2.0，`--ai` 恢复） |
 | 11 | 灯箱 EXIF 参数面板 | ✅ 已实现（`/api/exif` + `exif_summary()` + 灯箱 `lbExif`） |
@@ -98,6 +98,26 @@
   局部加强/修复。`COMMERCIAL_USE.md` 路线图第 2 项。
 - **收益**：从"半自动修图"跨到"可交付级修图"，人像工单刚需。
 - **改动范围**：大（前端 canvas 笔刷 + 蒙版合成管线 + 草稿/撤销序列化，估 500+ 行）。
+- **实施（2026-10-14）**：
+  - 后端：`PolishParams.local_region` 新增 `brush`；`_local_mask` brush 分支
+    采用外部画笔掩码（自动 resize 到工作分辨率）；`polish_image` 新增
+    `brush_mask` 参数。画笔作用于清晰度/磨皮/瑕疵/人脸修复（磨皮与修复
+    仍受皮肤/人脸识别限制，属合理语义）；曝光/白平衡/追色仍作用于全图。
+  - server：`retouch_adjustments` 新增 `brush_mask`（base64 灰度 PNG，
+    支持 data URL 前缀），`_decode_brush_mask` 解码并做尺寸/格式校验；
+    画笔掩码仅在单张编辑器流程生效（批量导出用统一参数，无手刷语义）。
+    空画笔区域时返回明确警告而非静默。
+  - 前端：「局部区域」下拉新增「画笔区域」；选中后显示画笔控件
+    （大小/羽化滑杆 + 画笔/橡皮擦/清除按钮）并在预览图上叠加 canvas
+    笔刷层。canvas 按 `object-fit:contain` 的实际图片区域定位（掩码
+    长宽比与原图一致，后端 resize 不变形）；软边笔刷用 shadowBlur 羽化；
+    pointer capture 支持鼠标/触控。掩码经 `toDataURL` 序列化进
+    `editor.retouch.brush_mask`，完全复用现有 retouch 历史 → 撤销/重做/
+    草稿持久化自动生效。
+  - 测试：`tests/test_local_retouch.py` 新增 `BrushMaskTests`（7 例：掩码
+    透传/resize/局部性/空区域警告/参数校验/base64 解码/render 会话）；
+    新增 `tests/smoke_brush.py`（Playwright 真实浏览器走查：切区域 →
+    手刷 → 掩码提交 → 撤销 → 重做 → 清除，9/9 通过，截图留档）。
 
 ### 9. 去噪/去模糊后端（Restormer / NAFNet）
 - **现状**：`COMMERCIAL_USE.md` 已预审许可（Restormer 仓库 MIT 候选），

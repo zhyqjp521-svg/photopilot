@@ -92,5 +92,89 @@ class LocalRetouchTests(unittest.TestCase):
         self.assertFalse(mask[:, 15:].any())
 
 
+class BrushMaskTests(unittest.TestCase):
+    """局部画笔掩码：_local_mask brush 分支 + polish_image 局部性 + server 解码。"""
+
+    def setUp(self):
+        rng = np.random.default_rng(11)
+        self.image = rng.integers(30, 220, (120, 160, 3), dtype=np.uint8)
+        self.brush = np.zeros((120, 160), np.float32)
+        self.brush[:60, :80] = 1.0
+
+    def test_brush_mask_passes_through_local_mask(self):
+        mask = polish._local_mask(self.image, [], 'brush', brush_mask=self.brush)
+        self.assertEqual(mask.shape, (120, 160))
+        np.testing.assert_allclose(mask, self.brush)
+        # 无画笔时退化为全图（保持可用），不静默丢弃效果
+        fallback = polish._local_mask(self.image, [], 'brush')
+        np.testing.assert_allclose(fallback, np.ones((120, 160), np.float32))
+
+    def test_brush_mask_resized_to_image_resolution(self):
+        small = np.zeros((30, 40), np.float32)
+        small[:, :20] = 1.0
+        mask = polish._local_mask(self.image, [], 'brush', brush_mask=small)
+        self.assertEqual(mask.shape, (120, 160))
+        self.assertGreater(float(mask[:, :40].mean()), .9)
+        self.assertLess(float(mask[:, 100:].mean()), .1)
+
+    def test_polish_clarity_applies_only_inside_brush(self):
+        params = polish.PolishParams(wb=0, skin=0, clarity=.8, local_region='brush')
+        result = polish.polish_image(self.image, params, faces=[], brush_mask=self.brush)
+        delta = np.abs(result.astype(float) - self.image.astype(float)).mean(axis=2)
+        self.assertGreater(float(delta[:60, :80].mean()), .5)
+        self.assertLess(float(delta[60:, 80:].mean()), .05)
+
+    def test_polish_warns_on_empty_brush_region(self):
+        warnings = []
+        params = polish.PolishParams(wb=0, clarity=.8, local_region='brush')
+        polish.polish_image(self.image, params, faces=[], warnings=warnings)
+        self.assertTrue(any('画笔区域为空' in message for message in warnings))
+
+    def test_params_validate_brush_region(self):
+        polish.PolishParams(local_region='brush')  # 不抛错
+        with self.assertRaises(ValueError):
+            polish.PolishParams(local_region='nope')
+
+    def test_server_decodes_brush_mask_base64(self):
+        import base64
+        import cv2
+        png = cv2.imencode('.png', (self.brush * 255).astype(np.uint8))[1]
+        encoded = base64.b64encode(png.tobytes()).decode()
+        decoded = server._decode_brush_mask(encoded)
+        self.assertEqual(decoded.shape, (120, 160))
+        self.assertGreater(float(decoded[:60, :80].mean()), .99)
+        decoded_url = server._decode_brush_mask('data:image/png;base64,' + encoded)
+        np.testing.assert_array_equal(decoded, decoded_url)
+        for bad in ('', 'not-base64!!!', 12345, None):
+            with self.assertRaises(ValueError):
+                server._decode_brush_mask(bad)
+
+    def test_render_session_applies_brush_mask(self):
+        import base64
+        import cv2
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'p.png'
+            Image.fromarray(self.image).save(source)
+            session = server._prepare({'folder': tmp, 'paths': [str(source)], 'operation': 'polish',
+                                       'polish': {'wb': 0, 'skin': 0, 'clarity': 0, 'local_region': 'all'}})
+            png = cv2.imencode('.png', (self.brush * 255).astype(np.uint8))[1]
+            encoded = base64.b64encode(png.tobytes()).decode()
+            def render(retouch):
+                with patch.object(server, 'analyze_faces', return_value=[]), \
+                     patch.object(server, 'THUMB_DIR', Path(tmp) / 'cache'):
+                    return server._process_one({'sid': session['sid'], 'path': str(source), 'preview_only': True,
+                                                'retouch_adjustments': retouch})
+            base = {'local_region': 'brush', 'brush_mask': None, 'clarity': 0, 'skin': 0,
+                    'retain': .4, 'face_repair': 0, 'blemish': 0}
+            with_brush = render({**base, 'brush_mask': encoded, 'clarity': .8})
+            without = render({**base})
+            a = np.asarray(Image.open(with_brush['out']).convert('RGB')).astype(float)
+            b = np.asarray(Image.open(without['out']).convert('RGB')).astype(float)
+            delta = np.abs(a - b).mean(axis=2)
+            h, w = delta.shape
+            # 画笔区内有差异、区外几乎一致（两组渲染仅清晰度作用范围不同）
+            self.assertGreater(float(delta[:h // 2, :w // 2].mean()), float(delta[h // 2:, w // 2:].mean()) * 3)
+
+
 if __name__ == '__main__':
     unittest.main()

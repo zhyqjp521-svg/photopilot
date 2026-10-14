@@ -31,7 +31,7 @@ class PolishParams:
     global_skin: bool = True  # 无人脸时是否做全图低强度柔肤
     face_repair: float = 0.0  # 人脸保守修复：去噪并恢复局部细节 0-1
     blemish: float = 0.0     # 肤色局部瑕疵抑制 0-1
-    local_region: str = "all"  # all | skin | face | eyes | background
+    local_region: str = "all"  # all | skin | face | eyes | background | brush
     auto_tone: bool = False  # 智能自动曝光/阴影/高光修正
     exposure: float = 0.0   # 手动曝光 EV，-3..3
     contrast: float = 0.0   # -1..1
@@ -48,7 +48,7 @@ class PolishParams:
             lower = -limit if name in {'exposure', 'contrast', 'highlights', 'shadows', 'temperature', 'saturation'} else 0.0
             if not np.isfinite(value) or not lower <= value <= limit:
                 raise ValueError(f'{name} 需在 {lower:g} 到 {limit:g} 之间')
-        if self.local_region not in {'all', 'global', '全图', 'skin', 'face', 'eyes', 'background'}:
+        if self.local_region not in {'all', 'global', '全图', 'skin', 'face', 'eyes', 'background', 'brush'}:
             raise ValueError('未知局部区域')
 
 
@@ -315,11 +315,24 @@ def repair_face(img: np.ndarray, mask: np.ndarray | None = None,
 
 
 def _local_mask(img: np.ndarray, faces: list, region: str,
-                eye_boxes: list | None = None) -> np.ndarray:
-    """按 UI 的局部区域选项生成 0–1 掩码。"""
+                eye_boxes: list | None = None,
+                brush_mask: np.ndarray | None = None) -> np.ndarray:
+    """按 UI 的局部区域选项生成 0–1 掩码。
+
+    brush_mask: 手刷的 0–1 掩码（与原图同尺寸），region == "brush" 时直接采用；
+    调用方负责把它 resize 到当前工作分辨率并做羽化。
+    """
     region = str(region or "all").lower()
     if region in {"all", "global", "全图"}:
         return np.ones(img.shape[:2], np.float32)
+    if region == "brush":
+        if brush_mask is None:
+            return np.ones(img.shape[:2], np.float32)
+        mask = np.asarray(brush_mask, np.float32)
+        if mask.shape[:2] != img.shape[:2]:
+            mask = cv2.resize(mask, (img.shape[1], img.shape[0]),
+                              interpolation=cv2.INTER_AREA)
+        return np.clip(mask, 0.0, 1.0)
     infos = [f for f in faces if isinstance(f, FaceInfo)]
     boxes = [f.box if isinstance(f, FaceInfo) else tuple(f) for f in faces]
     if region == "face":
@@ -437,7 +450,8 @@ def _blend(src: np.ndarray, dst: np.ndarray, strength: float) -> np.ndarray:
 def polish_image(img: np.ndarray, params: PolishParams | None = None,
                  faces: list[FaceInfo] | list | None = None,
                  warnings: list[str] | None = None,
-                 region_masks: list[np.ndarray] | None = None) -> np.ndarray:
+                 region_masks: list[np.ndarray] | None = None,
+                 brush_mask: np.ndarray | None = None) -> np.ndarray:
     """美化主流程。faces 允许外部传入 FaceInfo 列表（避免重复检测），缺省自动检测。
 
     顺序：白平衡 → 清晰度 → 磨皮 → 眼部。
@@ -445,6 +459,8 @@ def polish_image(img: np.ndarray, params: PolishParams | None = None,
     避免锐化把刚磨平的皮肤重新"打毛"。
     有 FaceMesh 关键点时用精确皮肤掩码（避开眉眼唇），否则退回 Haar+肤色范围。
     region_masks 可接收本次已计算的局部过滤蒙版，供预览叠层复用。
+    brush_mask: 手刷的 0–1 掩码，local_region == "brush" 时作为局部区域作用
+    于清晰度/磨皮/修复；由前端笔刷层产生，后端统一 resize/羽化。
     """
     p = params or PolishParams()
     out = auto_white_balance(img, p.wb)
@@ -463,7 +479,8 @@ def polish_image(img: np.ndarray, params: PolishParams | None = None,
     if boxes and p.local_region == 'eyes':
         eboxes = (eye_regions(face_infos) if face_infos and any(f.mesh for f in face_infos)
                   else _detect_eye_regions(out, boxes))
-    local = _local_mask(out, faces, p.local_region, eye_boxes=eboxes)
+    local = _local_mask(out, faces, p.local_region, eye_boxes=eboxes,
+                        brush_mask=brush_mask)
     if region_masks is not None:
         region_masks.append(local)
     if warnings is not None:
@@ -471,6 +488,8 @@ def polish_image(img: np.ndarray, params: PolishParams | None = None,
             label = {'face': '人脸', 'skin': '皮肤', 'eyes': '眼睛'}[p.local_region]
             reason = '未检测到人脸' if not boxes else f'未找到可用的{label}区域'
             warnings.append(f'{reason}：{label}局部修复未应用。请选择全图或其他区域；曝光、白平衡和追色仍作用于全图。')
+        elif p.local_region == 'brush' and (brush_mask is None or not np.any(brush_mask)):
+            warnings.append('画笔区域为空：请在预览图上手刷需要加强/修复的区域，或切回全图/其他区域。')
         elif not boxes and (p.face_repair > 0 or p.blemish > 0):
             warnings.append('未检测到人脸：人脸修复和瑕疵修复未应用；其他调节仍可使用。')
 
