@@ -41,7 +41,8 @@ import cv2
 import numpy as np
 
 from .io import (load_image, save_image, iter_images, unique_paths,
-                 collision_safe_output_names, output_suffix, resize_max, is_image)
+                 collision_safe_output_names, output_suffix, resize_max, is_image,
+                 extract_exif, extract_icc, srgb_icc_profile, exif_summary)
 from .cull import (score_photo, dhash, finalize_cull, smart_rank, PhotoScore, WORK_SIZE,
                    _get_pool, _get_fast_pool)
 from .color import (match_color, reference_from_image, reference_from_preset,
@@ -194,7 +195,7 @@ def _warm_engine():
                 for i in range(min(4, os.cpu_count() or 1))]
         for f in futs:
             f.result()
-        print("[warmup] 扫描引擎预热完成（人脸检测就绪；未授权美学模型不加载）")
+        print("[warmup] 扫描引擎预热完成（人脸检测 + 美学模型就绪）")
     except Exception as e:
         print(f"[warmup] 引擎预热失败（不影响功能）：{e}")
 
@@ -627,7 +628,8 @@ def _prepare(payload: dict, *, retain_session=True) -> dict:
             temperature=float(payload.get("polish", {}).get("temperature", 0)),
             saturation=float(payload.get("polish", {}).get("saturation", 0))),
         "paths": [str(p) for p in paths],
-        "output_names": collision_safe_output_names(str(p) for p in paths),
+        "output_names": collision_safe_output_names((str(p) for p in paths),
+                                                    preserve_raster=True),
     }
     export_size = payload.get("export_size", EXPORT_SIZE)
     ses["export_size"] = None if export_size == "original" else int(export_size)
@@ -792,7 +794,9 @@ def _render_session(ses: dict, payload: dict, *, output_destination=None) -> dic
     # Preview URLs are immutable so a browser cannot display a stale prior edit.
     dst = (Path(output_destination) if output_destination is not None else
            out_dir / (uuid.uuid4().hex + ".jpg" if preview_only else output_name))
-    save_image(final, dst, quality=ses.get("export_quality", 95))
+    save_image(final, dst, quality=ses.get("export_quality", 95),
+               exif=extract_exif(path),
+               icc_profile=extract_icc(path) or srgb_icc_profile())
     print(f"[process] 完成 {path.name}，耗时 {time.time()-started:.1f}s → {dst.name}")
     result = {"src": str(path), "out": str(dst), "preview_only": preview_only,
             "warnings": warnings,
@@ -809,11 +813,23 @@ def _render_session(ses: dict, payload: dict, *, output_destination=None) -> dic
     return result
 
 
+def _on_export_job_finished(payload: dict) -> None:
+    """导出任务到达终态时发系统通知（桌面模式下窗口可能被遮挡/最小化）。"""
+    from .platform import notify
+    total = payload.get('total', 0)
+    failed = payload.get('failed', 0)
+    if payload.get('state') == 'completed':
+        notify('PhotoPilot', f'批量导出完成：共 {total} 张')
+    else:
+        notify('PhotoPilot', f'批量导出结束：成功 {total - failed} 张，失败 {failed} 张')
+
+
 def _get_export_queue():
     global _EXPORT_QUEUE
     with _EXPORT_QUEUE_LOCK:
         if _EXPORT_QUEUE is None:
-            _EXPORT_QUEUE = ExportQueue(renderer=_render_export)
+            _EXPORT_QUEUE = ExportQueue(renderer=_render_export,
+                                       notifier=_on_export_job_finished)
         return _EXPORT_QUEUE
 
 
@@ -1183,6 +1199,12 @@ class Handler(BaseHTTPRequestHandler):
                 # 快审灯箱大图：复用缩略图管线（磁盘缓存 + 内存 LRU），上限 2200px
                 size = min(2200, max(360, int(q.get("s", ["2200"])[0])))
                 self._file(_thumb(q["p"][0], size), "image/jpeg")
+            elif u.path == "/api/exif":
+                # 灯箱拍摄参数面板：按需解析源图 EXIF（不含 RAW，见 exif_summary）
+                p = Path(q["p"][0])
+                if not p.is_file():
+                    raise FileNotFoundError(p)
+                self._json({"exif": exif_summary(p)})
             elif u.path == "/api/presets":
                 self._json({"presets": [{"name": name, **PRESET_META.get(name, {})}
                                          for name in PRESETS]})
@@ -1253,6 +1275,16 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('导出操作结构无效')
                 job = _get_export_queue().action(payload['id'], payload['action'])
                 self._json({'job': _public_export_job(job)})
+            elif self.path == "/api/reveal":
+                payload = json.loads(body or b'{}')
+                if not isinstance(payload, dict) or not isinstance(payload.get('path'), str) \
+                        or not payload['path'] or '\x00' in payload['path']:
+                    raise ValueError('路径无效')
+                p = Path(payload['path']).expanduser()
+                if not p.exists():
+                    raise ValueError(f'文件不存在：{p}')
+                _reveal_in_file_manager(str(p))
+                self._json({'ok': True})
             else:
                 self._json({"error": "not found"}, 404)
         except Exception as e:
@@ -1637,6 +1669,11 @@ input[type=range]::-webkit-slider-thumb:active{cursor:grabbing;transform:scale(1
 #lbStars .clr{font-size:15px;padding:3px 10px;border-radius:99px;border:1px solid rgba(255,255,255,.2)}
 #lbInfo{color:var(--dim);font-size:12.5px;font-variant-numeric:tabular-nums;display:flex;gap:14px;flex-wrap:wrap;justify-content:center}
 #lbInfo b{color:#fff}
+#lbExif{color:var(--dim);font-size:12.5px;font-variant-numeric:tabular-nums;display:flex;gap:10px 16px;flex-wrap:wrap;justify-content:center;align-items:center;width:100%}
+#lbExif b{color:#fff;font-weight:600}
+#lbExif .exsep{color:rgba(255,255,255,.18)}
+#lbExif .exgps{color:var(--accent);cursor:pointer}
+#lbExif .exgps:hover{text-decoration:underline}
 .lbKey{display:inline-block;padding:1px 7px;border-radius:6px;background:rgba(255,255,255,.14);
   color:#fff;font-size:11px;font-weight:600;margin:0 2px}
 .card.lbcur{border-color:#ffd60a;box-shadow:0 0 0 4px rgba(255,214,10,.22),var(--shadow-lg)}
@@ -1737,7 +1774,7 @@ input[type=range]::-webkit-slider-thumb:active{cursor:grabbing;transform:scale(1
       <div class="toolGroup" aria-label="分析选项">
         <span class="toolGroupLabel">分析</span>
         <label class="chk slim" title="跳过可大幅提速，适合先快速粗筛"><input type="checkbox" id="facesOpt" checked><span class="sw"></span>人脸分析</label>
-        <label class="chk slim" title="旧美学模型的商用许可证尚未核实，当前使用清晰度、曝光和人脸指标筛选"><input type="checkbox" id="aiOpt" disabled><span class="sw"></span>美学模型（待授权）</label>
+        <label class="chk slim" title="用 NIMA 神经网络美学分（idealo MobileNet，Apache-2.0）加权综合分，约 +90ms/张"><input type="checkbox" id="aiOpt"><span class="sw"></span>美学模型</label>
         <label class="chk slim" title="扫描时递归进入子文件夹（婚礼/旅拍分日文件夹必备）"><input type="checkbox" id="recursiveOpt"><span class="sw"></span>含子文件夹</label>
         <label class="toolSelect" title="下一次扫描生效；严格模式减少误合并，宽松模式允许更多差异"><span>相似程度</span><select id="similarityProfile" aria-label="相似分组严格程度" onchange="projectChanged()"><option value="strict">严格</option><option value="balanced" selected>均衡</option><option value="loose">宽松</option></select></label>
       </div>
@@ -1875,6 +1912,7 @@ input[type=range]::-webkit-slider-thumb:active{cursor:grabbing;transform:scale(1
   <div class="sm">支持整个文件夹（含子文件夹）· JPEG / PNG / RAW</div></div></div>
 <div id="lb">
   <div id="lbTop"><span id="lbName"></span><span id="lbIdx"></span>
+    <button class="btn ghost" id="lbReveal" onclick="revealCurrent()">在 Finder 中显示</button>
     <button class="btn ghost" id="lbClose" onclick="lbHide()">完成 Esc</button></div>
   <div id="lbStage"><div id="lbSpin">加载中…</div>
     <img id="lbImg" src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=" alt="照片预览">
@@ -1883,6 +1921,7 @@ input[type=range]::-webkit-slider-thumb:active{cursor:grabbing;transform:scale(1
   <div id="lbBar">
     <div id="lbStars"></div>
     <div id="lbInfo"></div>
+    <div id="lbExif"></div>
     <div style="color:var(--dim);font-size:11.5px">
       <span class="lbKey">←</span><span class="lbKey">→</span>切换
       <span class="lbKey">空格</span>保留/移出
@@ -2543,6 +2582,9 @@ function updateStats(){
   const recommended=library.filter(autoSel).length;
   $('scanInfo').textContent=`共 ${total} 张 · 当前显示 ${visible} · 当前可见已选 ${selection.visible} · 全部已选 ${selection.total}`;
   $('scanInfo').title=`共 ${total} 张 · 推荐 ${recommended} 张 · 隐藏已选 ${selection.hidden} 张`;
+  // 窗口标题随项目更新（WKWebView/多窗口/Spotlight 切换时有用）
+  const folder=(PROJECT.folder||'').split('/').filter(Boolean).pop()||'PhotoPilot';
+  document.title=`${folder} · ${total} 张 — PhotoPilot`;
 }
 function updateTargetUI(){
   const info=$('targetInfo'),clear=$('clearTarget');
@@ -2701,6 +2743,10 @@ function makeCard(p,idx,animate=true){
   const cmp=d.querySelector('.compareBtn');
   if(cmp)cmp.onclick=e=>{e.stopPropagation();openGroupCompare(p.group);};
   d.ondblclick=()=>{const i=ranked.findIndex(x=>x.path===p.path);if(i>=0)lbShow(i);};
+  d.addEventListener('contextmenu',e=>{
+    e.preventDefault();e.stopPropagation();
+    revealPath(p.path);
+  });
   ringQ.push(d.querySelector('.ring'));
   return d;}
 
@@ -2855,6 +2901,18 @@ window.addEventListener('resize',()=>{
   if(ranked.length<1200||virtualResizeQueued)return;
   virtualResizeQueued=true;
   requestAnimationFrame(()=>{virtualResizeQueued=false;rebuildView();});
+});
+// 窗口尺寸记忆：resize 防抖后回传原生侧持久化（pywebview 不可用时静默）
+let _geomTimer=null;
+window.addEventListener('resize',()=>{
+  clearTimeout(_geomTimer);
+  _geomTimer=setTimeout(()=>{
+    try{
+      if(window.pywebview&&window.pywebview.api&&window.pywebview.api.save_geometry){
+        window.pywebview.api.save_geometry(window.innerWidth,window.innerHeight);
+      }
+    }catch(e){}
+  },600);
 });
 
 function selAll(mode){
@@ -3571,9 +3629,22 @@ function syncBatchControls(){
   $('batchRating').disabled=!count||busy;
   $('batchRateBtn').disabled=!count||busy;
   const editorBusy=!!(CURRENT_EDITOR?.exporting&&selectedPaths.has(CURRENT_EDITOR.path));
-  $('projectRemoveBtn').disabled=!count||busy||PROJECT.blocked||editorBusy;
   const exportBusy=[...EXPORT_QUEUE.jobs.values()].some(job=>['queued','running','paused'].includes(job.state));
-  $('trashBtn').disabled=!count||busy||PROJECT.blocked||PROCESS_BUSY||SCAN_ACTIVE||!!JOB||exportBusy||editorBusy;
+  const commonReasons=[];
+  if(!count)commonReasons.push('请先在网格中选中照片');
+  if(busy)commonReasons.push('批量操作正在进行，请等待完成');
+  if(PROJECT.blocked)commonReasons.push('项目处于「恢复受保护」状态（有原片缺失或已变化）：请先点上方「重试恢复」，或重新扫描 / 导入');
+  if(editorBusy)commonReasons.push('所选照片正在导出，请等待导出完成');
+  const removeBlocked=commonReasons.length>0;
+  $('projectRemoveBtn').disabled=removeBlocked;
+  $('projectRemoveBtn').title=removeBlocked?'暂不可用 · '+commonReasons.join('；'):'从项目清单移除所选照片；本地原片与 XMP 文件保留，可撤销';
+  const trashReasons=[...commonReasons];
+  if(PROCESS_BUSY)trashReasons.push('色彩 / 磨皮批处理正在运行');
+  if(SCAN_ACTIVE||JOB)trashReasons.push('扫描正在进行');
+  if(exportBusy)trashReasons.push('导出队列存在未完成任务（含「已暂停」）：请先在导出队列完成，或点「清除记录」');
+  const trashBlocked=trashReasons.length>0;
+  $('trashBtn').disabled=trashBlocked;
+  $('trashBtn').title=trashBlocked?'暂不可用 · '+trashReasons.join('；'):'把所选照片的本地原片（连同同名 XMP）移到系统废纸篓 / 回收站，之后可从废纸篓恢复';
   $('splitGroups').disabled=!count||busy||SCAN_ACTIVE||!!JOB||PROJECT.blocked;
   $('mergeGroups').disabled=count<2||busy||SCAN_ACTIVE||!!JOB||PROJECT.blocked;
   syncCullingHistoryButtons();
@@ -3934,11 +4005,41 @@ function lbRenderStars(r){
 function lbShow(i){LBI=i;$('lb').classList.add('show');lbUpdate(true);}
 function lbHide(){$('lb').classList.remove('show');}
 function lbCard(p){return cardCache.get(p.path);}
+let lbExifSeq=0;
+function lbRenderExif(ex){
+  const box=$('lbExif');
+  if(!ex){box.textContent='';return;}
+  const parts=[];
+  if(ex.camera)parts.push(`<span>${escapeHtml(ex.camera)}</span>`);
+  if(ex.lens)parts.push(`<span>${escapeHtml(ex.lens)}</span>`);
+  if(ex.aperture)parts.push(`<span>光圈 <b>${ex.aperture}</b></span>`);
+  if(ex.exposure)parts.push(`<span>快门 <b>${ex.exposure}</b></span>`);
+  if(ex.iso!==undefined)parts.push(`<span>ISO <b>${ex.iso}</b></span>`);
+  if(ex.focal)parts.push(`<span>焦段 <b>${ex.focal}</b></span>`);
+  if(ex.focal_equiv)parts.push(`<span>${ex.focal_equiv}</span>`);
+  if(ex.datetime)parts.push(`<span>${escapeHtml(ex.datetime)}</span>`);
+  if(ex.resolution)parts.push(`<span>${ex.resolution}</span>`);
+  if(ex.gps){
+    const [lat,lon]=ex.gps;
+    const maps='https://www.openstreetmap.org/?mlat='+lat+'&mlon='+lon+'#map=15/'+lat+'/'+lon;
+    parts.push(`<span class="exgps" title="在地图查看" onclick="window.open('${maps}')">📍 ${lat}, ${lon}</span>`);}
+  box.innerHTML=parts.join('<span class="exsep">·</span>');
+}
+function lbLoadExif(){
+  const p=ranked[LBI];if(!p)return;
+  const seq=++lbExifSeq;
+  $('lbExif').textContent='';
+  api('/api/exif?p='+encodeURIComponent(p.path)).then(j=>{
+    if(seq!==lbExifSeq)return;         // 已翻页，丢弃过期响应
+    lbRenderExif(j.exif);
+  }).catch(()=>{if(seq===lbExifSeq)$('lbExif').textContent='';});
+}
 function lbUpdate(reload){
   const p=ranked[LBI];if(!p)return;
   $('lbName').textContent=p.path.split('/').pop();
   $('lbIdx').textContent=(LBI+1)+' / '+ranked.length;
   lbRenderStars(p.rating||0);
+  lbLoadExif();
   $('lbInfo').innerHTML=`<span>综合分 <b>${p.score.toFixed(2)}</b></span>`
     +(p.faces?`<span>人脸 <b>${p.faces}</b></span>`:'')
     +(p.flags.length?p.flags.map(f=>`<span>${escapeHtml(f)}</span>`).join(''):'<span><b>通过</b></span>');
@@ -3956,6 +4057,15 @@ function lbUpdate(reload){
 function lbNav(d){
   if(!ranked.length)return;
   LBI=(LBI+d+ranked.length)%ranked.length;lbUpdate(true);}
+async function revealPath(path){
+  if(!path)return;
+  try{await api('/api/reveal',{path});}
+  catch(e){toast('无法定位文件：'+e.message);}
+}
+function revealCurrent(){
+  const p=ranked[LBI];if(!p)return;
+  revealPath(p.path);
+}
 async function lbRate(r){
   const p=ranked[LBI];if(!p)return false;
   return setRating(p,r);
@@ -4063,6 +4173,26 @@ def _acquire_app_instance_lock(lock_path: Path | None = None):
         raise
 
 
+def _reveal_in_file_manager(path: str) -> None:
+    """在系统文件管理器里定位并高亮指定文件/文件夹。
+
+    macOS 用 `open -R`（Finder 中显示）；Windows 用 explorer /select；
+    Linux 用 xdg-open（无高亮，仅打开所在目录）。失败抛 OSError。
+    """
+    import subprocess
+    import shutil
+    target = str(Path(path).expanduser())
+    if os.name == "nt":
+        subprocess.run(["explorer", "/select,", target], check=True)
+    elif sys.platform == "darwin":
+        subprocess.run(["open", "-R", target], check=True)
+    else:
+        d = shutil.which("xdg-open")
+        if not d:
+            raise OSError("当前系统无可用文件管理器")
+        subprocess.run([d, str(Path(target).parent)], check=True)
+
+
 def _find_free_port(preferred: int = 8618) -> int:
     import socket
     for p in range(preferred, preferred + 20):
@@ -4134,6 +4264,65 @@ def _locate_chrome() -> str | None:
     return None
 
 
+def _dock_badge_loop():
+    """桌面模式：扫描/导出进度同步到 Dock 图标徽标；空闲时清除。
+
+    macOS 专用能力（platform.dock_badge 内部静默降级），每 2s 轮询一次，
+    任何异常只影响徽标、绝不影响业务。
+    """
+    from .platform import dock_badge
+    while True:
+        time.sleep(2)
+        try:
+            label = None
+            # 1) 最近一个未结束的扫描任务：显示 done/total
+            for job in reversed(list(SCAN_JOBS.values())):
+                if not job.get("finished") and job.get("total"):
+                    label = f"{job.get('done', 0)}/{job['total']}"
+                    break
+            # 2) 无扫描时看导出队列剩余张数
+            if label is None:
+                remaining = 0
+                for pub in _get_export_queue().list(summaries=True):
+                    if pub["state"] in {"queued", "running"}:
+                        counts = pub.get("counts", {})
+                        remaining += counts.get("pending", 0) + counts.get("running", 0)
+                if remaining:
+                    label = str(remaining)
+            dock_badge(label)
+        except Exception:
+            pass
+
+
+def _window_geometry_path() -> Path:
+    return cache_dir() / "window_geometry.json"
+
+
+def _load_window_geometry() -> tuple[int, int]:
+    """读取上次保存的窗口尺寸（w, h）；无/损坏时返回默认 1440×920。"""
+    try:
+        data = json.loads(_window_geometry_path().read_text(encoding="utf-8"))
+        w = int(data.get("width", 0))
+        h = int(data.get("height", 0))
+        if 600 <= w <= 10000 and 500 <= h <= 10000:
+            return w, h
+    except Exception:
+        pass
+    return 1440, 920
+
+
+def _save_window_geometry(width: int, height: int) -> None:
+    try:
+        w, h = int(width), int(height)
+        if not (600 <= w <= 10000 and 500 <= h <= 10000):
+            return
+        _window_geometry_path().parent.mkdir(parents=True, exist_ok=True)
+        _window_geometry_path().write_text(
+            json.dumps({"width": w, "height": h}), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def run_app(folder: str | None = None, port: int = 0):
     """桌面软件模式：pywebview 原生窗口（macOS WKWebView / Windows WebView2），不开浏览器标签页。
 
@@ -4148,6 +4337,9 @@ def run_app(folder: str | None = None, port: int = 0):
         return
     if instance_lock is None:
         print("PhotoPilot 已在运行，本次启动已忽略；请切换到已打开的窗口。")
+        # .app 双击启动没有控制台，print 用户看不到；弹系统通知并激活已有窗口。
+        from .platform import activate_running_instance
+        activate_running_instance()
         return
     # Keep the file handle alive so the OS lock lasts for the whole app session.
 
@@ -4167,6 +4359,8 @@ def run_app(folder: str | None = None, port: int = 0):
     httpd = start_server(folder, port)
     url = f"http://127.0.0.1:{port}"
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    threading.Thread(target=_dock_badge_loop, daemon=True,
+                     name="PhotoPilotDockBadge").start()
     log_launch(f"PhotoPilot startup: engine={url}")
     print(f"PhotoPilot 引擎运行中：{url}")
 
@@ -4188,7 +4382,12 @@ def run_app(folder: str | None = None, port: int = 0):
                                 "*.arw;*.cr2;*.cr3;*.nef;*.nrw;*.dng;*.raf;*.orf;*.rw2;*.pef;*.srw;*.x3f)",))
                 return list(result) if result else None
 
-        webview.create_window("PhotoPilot", url, width=1440, height=920,
+            def save_geometry(self, width, height):
+                # 前端窗口 resize 时回调，持久化尺寸供下次启动恢复。
+                _save_window_geometry(width, height)
+
+        win_w, win_h = _load_window_geometry()
+        webview.create_window("PhotoPilot", url, width=win_w, height=win_h,
                               min_size=(1080, 680), background_color="#101014",
                               js_api=NativeDialogs())
         webview.start()          # 窗口关闭即返回

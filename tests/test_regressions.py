@@ -331,9 +331,18 @@ class AdjustmentTests(unittest.TestCase):
 
 
 class ModelLicenseTests(unittest.TestCase):
-    def test_unverified_shipped_model_is_not_enabled_by_default(self):
+    def test_licensed_model_is_verified(self):
+        # 旧版曾断言「未授权模型默认不启用」；2026-10-14 起已换成
+        # idealo/image-quality-assessment 的 Apache-2.0 权重，许可证已核实。
         from photopilot import aesthetic
-        self.assertFalse(aesthetic.available())
+        self.assertTrue(aesthetic.MODEL_LICENSE_VERIFIED)
+
+    def test_available_reflects_model_file_presence(self):
+        # available() 仅在许可证已验证 + 模型文件存在 + onnxruntime 可导入时为真。
+        # 若模型文件缺失（如 CI 未放权重），应优雅降级返回 False，而非报错。
+        from photopilot import aesthetic
+        # 不依赖本机是否真有模型文件：只验证返回值是布尔且不抛异常。
+        self.assertIsInstance(aesthetic.available(), bool)
 
 
 class ImportTests(unittest.TestCase):

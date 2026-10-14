@@ -2,7 +2,8 @@
 
 全本地运行的批量照片处理工具：**智能筛选（清晰度、曝光、人脸与眨眼检测）→
 批量白平衡 → 追色统一色调 → 磨皮美化 → 导出成品 + 报告**。无云端、无订阅、
-CPU 即可运行。旧 NIMA 权重授权未核实，当前停用；商业分发前须完成依赖及资产审计，见
+CPU 即可运行。美学评分采用 idealo/image-quality-assessment 的 Apache-2.0 权重；
+商业分发前须完成依赖及资产审计，见
 [商业使用记录](docs/COMMERCIAL_USE.md)。提供 **macOS 桌面软件**（双击图标、原生窗口）、
 本地 Web UI 与 CLI 三种用法。
 
@@ -24,7 +25,7 @@ photopilot ui /path/to/photos          # 自动打开 http://127.0.0.1:8618
 #    ←/→ 或 J/K 切换 · 空格 加入/移出保留 · 0-5 打星级（写 XMP）· Esc 退出
 
 # 0c) 智能筛选：扫描后点「智能筛选」一键保留
-#    旧美学模型暂停加载，--ai 暂时回退传统指标，不影响人脸/眨眼检测。
+#    勾选「美学模型」后用 NIMA 美学分（idealo MobileNet，Apache-2.0）加权综合分。
 
 # 1) 批量打分筛选（连拍去重 + 眨眼检测 + AI 美学评分，可写星级）
 photopilot cull  ./photos --top 30 --ai --write-xmp
@@ -151,8 +152,10 @@ node tests/frontend_regressions.cjs
 单张人像实时调节、草稿、蒙版与桌面实测见
 [单张精修验收](docs/qa-2026-10-03-live-retouch/report.md)。
 
-真实人像用 `demo/hopper.jpg`（TensorFlow 官方分发的 Grace Hopper 公有领域
-照片）验证 FaceMesh 检测、EAR 眨眼指标、精确皮肤掩码与眼部提亮。
+真实人像用 `demo/hopper.jpg`（Grace Hopper 公有领域照片，来源
+[Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Grace_Hopper.jpg)，
+亦为 TensorFlow 官方测试图）验证 FaceMesh 检测、EAR 眨眼指标、精确皮肤掩码与
+眼部提亮。该照片仅作算法验证，不作为宣传人像资产。
 
 ## 性能
 
@@ -180,7 +183,7 @@ photopilot/
 ├── io.py             JPEG/PNG(Pillow+EXIF 纠偏) 与 RAW(rawpy/LibRaw) 统一读取
 ├── colorops.py       sRGB↔OKLab、色域压缩、肤色掩码（追色/美化共用）
 ├── face_analysis.py  MediaPipe FaceMesh：EAR 眨眼检测、关键点皮肤掩码、眼部定位
-├── aesthetic.py      旧 NIMA 接口（权重商用授权未核实，当前停用）
+├── aesthetic.py      NIMA 美学评分（idealo MobileNet，Apache-2.0，ONNX）
 ├── cull.py           筛选引擎：多维打分 + 连拍分组（dHash）+ 闭眼重罚，线程池并行
 ├── color.py          追色：5 种算法 + 参考统计缓存 + 强度/保亮度/肤色保护 + 预设
 ├── polish.py         美化：白平衡 → 清晰度 → 频率分离磨皮 → 眼部
@@ -195,7 +198,7 @@ photopilot/
 | 能力 | 借鉴的开源项目 | 本项目的实现与扩展 |
 |---|---|---|
 | 多维打分 | [Facet](https://github.com/ncoevoet/facet)（9 维评分思路） | 轻量重实现：全图+分块 P75 双尺度清晰度、曝光/裁剪、RMS 对比度、Hasler 色彩丰富度、人脸质量；**批内相对模糊判定** |
-| AI 美学评分 | [NIMA](https://research.google/pubs/pub46993/) 论文与 [上游旧权重](https://huggingface.co/cromsc/nima-mobilenet-aesthetic) | 上游无模型卡及明确权重许可，当前禁止加载，源码分发排除权重。保留本机旧文件，不视为可商用资产 |
+| AI 美学评分 | [NIMA](https://research.google/pubs/pub46993/) 论文与 [idealo/image-quality-assessment](https://github.com/idealo/image-quality-assessment)（Apache-2.0） | MobileNet 美学权重转 ONNX 本地推理，与传统指标加权融合；硬伤规则（闭眼/模糊/连拍重复）一票否决 |
 | 多参考追色 | 商业调色软件的"分场景匹配"实践 | auto 模式下 OKLab 均值 k-means++（固定种子）聚 ≤4 组，组内独立求参考统计；≥4 张生效，report.json 记录组数 |
 | 批量白平衡 | Capture One / Lightroom 的整批统一色温实践 | 灰度世界逐张估计通道均值 → 中位数为整批目标（抗离群）→ 校正比直接乘回；服务/UI/CLI/pipeline 四处可用 |
 | 眨眼检测 | 商业筛选软件（Aftershoot 等）的头号规则 | [MediaPipe FaceMesh](https://github.com/google-ai-edge/mediapipe) 468 点网格 + **EAR（Soukupová & Čech 2016）**，闭眼重罚、单眼眨眼标记；无 mediapipe 时回退 Haar 框 |

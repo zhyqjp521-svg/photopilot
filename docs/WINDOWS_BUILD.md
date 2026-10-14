@@ -97,6 +97,12 @@ onnxruntime、Pillow、rawpy(LibRaw)、pywebview 等全部依赖。
 | 导入照片目录 | `~/Pictures/PhotoPilot` | `%USERPROFILE%\Pictures\PhotoPilot` |
 | Chrome/Edge 回退窗口 | 探测 Chrome/Edge | 探测 Chrome/Edge（含 `msedge.exe`） |
 | Linux 支持 | — | 额外支持：XDG 路径 + freedesktop Trash |
+| 导出保留 EXIF/ICC | 透传源 EXIF + 嵌入 sRGB ICC | 相同（`io.extract_exif`/`extract_icc`/`srgb_icc_profile`） |
+| 导出 TIFF | 保留 `.tif/.tiff` 源格式 | 相同（`preserve_raster=True`，Deflate 压缩） |
+| 二次启动激活 | 通知 + 激活已有窗口 | 通知（Windows 无零依赖 activate，静默降级） |
+| 在文件管理器显示 | Finder `open -R` | 资源管理器 `explorer /select` |
+| 导出完成通知 | osascript 通知 | 静默跳过（页面内提示仍可用） |
+| Dock/任务栏进度 | Dock 徽标 | 静默跳过（无零依赖方案） |
 
 其余核心能力（扫描打分、追色、磨皮美化、白平衡、XMP 星级、RAW 解码、批量导出队列、
 单张精修、撤销重做、项目恢复、快审灯箱、智能分组比较）与平台无关，三种系统行为一致。

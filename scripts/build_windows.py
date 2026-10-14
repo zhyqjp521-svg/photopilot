@@ -79,12 +79,19 @@ def _build_command(name: str, console: bool) -> list[str]:
     在不同 PyInstaller 版本间的兼容问题。
 
     --collect-all mediapipe   收集内置 tflite 人脸模型与子模块（缺了人脸检测会失效）
-    --collect-all onnxruntime 收集原生推理库
+    --collect-all onnxruntime 收集原生推理库（NIMA 美学评分）
+    --add-data models/...     美学模型权重（Apache-2.0 idealo MobileNet）
     --collect-data cv2        收集 haarcascade 级联数据
     --collect-data rawpy      收集 LibRaw 附带数据
     --collect-submodules send2trash  Windows/Linux 回收站
     """
     window_flag = "--console" if console else "--windowed"
+    model = ROOT / "models" / "nima_mobilenet_aesthetic_apache.onnx"
+    if not model.exists():
+        sys.exit(
+            "缺少美学模型 models/nima_mobilenet_aesthetic_apache.onnx：\n"
+            "请先从 idealo/image-quality-assessment（Apache-2.0）下载 "
+            "weights_mobilenet_aesthetic_0.07.hdf5 并转为 ONNX，或从发布包恢复。")
     return [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean",
@@ -93,6 +100,7 @@ def _build_command(name: str, console: bool) -> list[str]:
         "--name", name,
         "--collect-all", "mediapipe",
         "--collect-all", "onnxruntime",
+        "--add-data", f"{model};models",
         "--collect-data", "cv2",
         "--collect-data", "rawpy",
         "--collect-submodules", "send2trash",
@@ -100,9 +108,6 @@ def _build_command(name: str, console: bool) -> list[str]:
         "--exclude-module", "tkinter",
         "--exclude-module", "pandas",
         "--exclude-module", "IPython",
-        # onnxruntime 仅供已停用的 NIMA 美学模型使用（MODEL_LICENSE_VERIFIED=False），
-        # 当前代码路径不会 import 它；排除可显著减小体积。启用 NIMA 时需移除本行。
-        "--exclude-module", "onnxruntime",
         str(ENTRY),
     ]
 

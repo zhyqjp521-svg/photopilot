@@ -1,3 +1,4 @@
-# Unverified model weights must not enter source distributions.
+# Model weights (Apache-2.0 idealo NIMA ONNX) stay out of sdist: large binary,
+# fetched/restored separately (see docs/THIRD_PARTY_LICENSES.md).
 prune photopilot/models
 prune models

@@ -124,3 +124,50 @@ def _trash_send2trash(path: Path) -> None:
 def app_data_file(name: str) -> Path:
     """应用数据目录下的一个具名文件。"""
     return app_data_dir() / name
+
+
+def notify(title: str, message: str) -> None:
+    """发一条系统通知（尽力而为：失败静默，绝不影响业务流程）。
+
+    macOS 用 osascript display notification；
+    Windows / Linux 暂无零依赖方案，静默跳过（页面内 toast 仍可用）。
+    """
+    if not IS_MACOS:
+        return
+    try:
+        import subprocess
+        safe_title = title.replace('"', '\u201d').replace("\\", "\\\\")
+        safe_message = message.replace('"', '\u201d').replace("\\", "\\\\")
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{safe_message}" with title "{safe_title}"'],
+            capture_output=True, timeout=5, check=False)
+    except Exception:
+        pass
+
+
+def dock_badge(text: str | None) -> None:
+    """更新 Dock 图标上的进度徽标；None 清除。尽力而为，失败静默。"""
+    if not IS_MACOS:
+        return
+    try:
+        from AppKit import NSApplication
+        tile = NSApplication.sharedApplication().dockTile()
+        tile.setBadgeLabel_(text if text else None)
+    except Exception:
+        pass
+
+
+def activate_running_instance(app_name: str = "PhotoPilot") -> None:
+    """已有实例在运行、本次启动被单实例锁拒绝时：弹通知并把已有窗口带到前台。"""
+    notify(app_name, "已在运行，已为你切换到已打开的窗口")
+    if not IS_MACOS:
+        return
+    try:
+        import subprocess
+        # 把 PhotoPilot.app 的已有窗口激活到前台；找不到该应用名时静默忽略。
+        subprocess.run(
+            ["osascript", "-e", f'tell application "{app_name}" to activate'],
+            capture_output=True, timeout=5, check=False)
+    except Exception:
+        pass

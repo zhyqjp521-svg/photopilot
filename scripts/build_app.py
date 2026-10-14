@@ -41,7 +41,7 @@ for arg in "$@"; do
 done
 log_dir="$HOME/Library/Logs"
 mkdir -p "$log_dir"
-exec /usr/bin/arch -arm64 "{python}" -m photopilot app "${{args[@]}}" \
+exec "{python}" -m photopilot app "${{args[@]}}" \
     >> "$log_dir/PhotoPilot-launcher.log" 2>&1
 """
 

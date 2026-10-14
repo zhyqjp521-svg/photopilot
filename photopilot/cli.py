@@ -16,7 +16,8 @@ from .cull import cull_folder
 from .color import (PRESETS, match_color, reference_from_image,
                     reference_from_preset)
 from .polish import polish_image, PolishParams
-from .io import load_image, save_image, iter_images
+from .io import (load_image, save_image, iter_images,
+                 extract_exif, extract_icc, srgb_icc_profile)
 from .pipeline import run_pipeline
 from .xmp import write_sidecar
 
@@ -171,7 +172,8 @@ def main(argv=None):
                               skin_protect=args.skin_protect)
             dst = (Path(args.out_dir) if args.out_dir else p.parent) / \
                   f"{p.stem}{args.suffix}{p.suffix.lower()}"
-            save_image(out, dst)
+            save_image(out, dst, exif=extract_exif(p),
+                       icc_profile=extract_icc(p) or srgb_icc_profile())
             print(f"{p.name} → {dst.name}")
 
     elif args.cmd == "polish":
@@ -185,7 +187,8 @@ def main(argv=None):
             out = polish_image(img, params)
             dst = (Path(args.out_dir) if args.out_dir else p.parent) / \
                   f"{p.stem}{args.suffix}{p.suffix.lower()}"
-            save_image(out, dst)
+            save_image(out, dst, exif=extract_exif(p),
+                       icc_profile=extract_icc(p) or srgb_icc_profile())
             print(f"{p.name} → {dst.name}")
 
     elif args.cmd == "run":
@@ -216,7 +219,8 @@ def main(argv=None):
             img = load_image(p, max_size=args.max_size)
             out = apply_wb_gains(img, target / g, args.strength)
             dst = (out_dir if out_dir else p.parent) /                   f"{p.stem}{args.suffix}{p.suffix.lower() if p.suffix.lower() != '.jpeg' else '.jpg'}"
-            save_image(out, dst)
+            save_image(out, dst, exif=extract_exif(p),
+                       icc_profile=extract_icc(p) or srgb_icc_profile())
             print(f"      {p.name} → {dst.name}")
 
     elif args.cmd == "app":

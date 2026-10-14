@@ -19,3 +19,6 @@ demo/ui_demo/
 /.thumbcache/
 demo/bigset/
 demo/photopilot_out/
+
+# 桌面冒烟测试截图产物
+tests/_smoke_out/

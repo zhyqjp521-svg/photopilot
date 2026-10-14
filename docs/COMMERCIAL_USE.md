@@ -7,12 +7,14 @@
 - 对标像素蛋糕的工作流与公开能力，不复制它的品牌、界面素材、商业预设或私有实现。
 - 本次新增基础调色、同步对比平移、原图上传、高清导出、自定义 JSON 参数由本项目实现，
   未下载第三方 LUT、样片或模型。
-- 原有 `models/nima_mobilenet_aesthetic.onnx` 的分发页没有模型卡或明确权重许可证。
-  `MODEL_LICENSE_VERIFIED=False` 阻止默认加载；本机文件保留以免丢失用户数据。
-  `MANIFEST.in` 排除模型目录。Git 历史曾包含该文件，商业分发不能直接复制整仓或历史。
+- 原有 `models/nima_mobilenet_aesthetic.onnx` 的分发页没有模型卡或明确权重许可证，
+  已于 2026-10-14 从工作区与 git 历史中彻底移除；改为采用
+  idealo/image-quality-assessment 的 MobileNet 美学权重（明确 **Apache-2.0**），
+  转 ONNX 后作为 `models/nima_mobilenet_aesthetic_apache.onnx` 使用，
+  `MODEL_LICENSE_VERIFIED=True`，`--ai` 已恢复。
 - 没有把项目擅自改为 MIT；原 README 的“MIT（建议）”和“依赖全部商用友好”已更正。
 
-来源：[旧 NIMA 分发页](https://huggingface.co/cromsc/nima-mobilenet-aesthetic)、
+来源：[idealo/image-quality-assessment](https://github.com/idealo/image-quality-assessment)（Apache-2.0）、
 [公开产品能力](https://www.pixcakes.com/)。
 
 ## 后续模型筛选

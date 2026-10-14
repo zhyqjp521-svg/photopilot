@@ -79,7 +79,7 @@ def _integer(value):
 
 
 class ExportQueue:
-    def __init__(self, path=None, renderer=None, autostart=True):
+    def __init__(self, path=None, renderer=None, autostart=True, notifier=None):
         if path or os.environ.get('PHOTOPILOT_EXPORT_PATH'):
             default = path or os.environ.get('PHOTOPILOT_EXPORT_PATH')
         else:
@@ -87,6 +87,8 @@ class ExportQueue:
             default = app_data_dir() / 'exports.json'
         self.path = Path(default).expanduser()
         self.renderer = renderer
+        # 可选终态回调：job 到达 completed/failed 时在锁外调用（桌面通知等）。
+        self.notifier = notifier
         self.error = None
         self._state = {'version': 1, 'jobs': []}
         self._condition = threading.Condition(threading.RLock())
@@ -418,6 +420,7 @@ class ExportQueue:
                     raise ValueError('source changed during export')
             except Exception as exc:
                 error = str(exc)[:1000] or type(exc).__name__
+            notification = None
             with self._condition:
                 self._active = None
                 candidate = copy.deepcopy(self._state)
@@ -432,6 +435,12 @@ class ExportQueue:
                     finished['state'] = 'failed' if any(i['state'] == 'failed' for i in finished['items']) else 'completed'
                 elif finished['state'] != 'paused':
                     finished['state'] = 'queued'
+                if finished['state'] in {'completed', 'failed'}:
+                    notification = {
+                        'id': jid, 'state': finished['state'],
+                        'total': len(finished['items']),
+                        'failed': sum(1 for i in finished['items'] if i['state'] == 'failed'),
+                    }
                 finished['updated_at'] = time.time()
                 if self.error:
                     # A failed user checkpoint must remain latched. Keep the
@@ -447,6 +456,12 @@ class ExportQueue:
                     self._thread = None
                     return
                 self._condition.notify_all()
+            if notification and callable(self.notifier):
+                # 锁外调用，回调异常绝不影响导出循环。
+                try:
+                    self.notifier(notification)
+                except Exception:
+                    pass
 
     def shutdown(self, timeout=5):
         with self._condition:

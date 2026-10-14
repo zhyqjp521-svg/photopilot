@@ -16,7 +16,8 @@ import cv2
 import numpy as np
 
 from .io import (load_image, save_image, resize_max,
-                 collision_safe_output_names)
+                 collision_safe_output_names, extract_exif, extract_icc,
+                 srgb_icc_profile)
 from .cull import cull_folder, CullReport, PhotoScore, WORK_SIZE
 from .face_analysis import analyze_faces, scale_faces
 from .color import (ColorReference, match_color, reference_from_image,
@@ -200,7 +201,9 @@ def run_pipeline(input_dir: str | Path,
         final = polish_image(graded, p, faces=faces_final)
 
         dst = out / output_names[k.path]
-        save_image(final, dst, quality=export_quality)
+        save_image(final, dst, quality=export_quality,
+                   exif=extract_exif(src),
+                   icc_profile=extract_icc(src) or srgb_icc_profile())
         result.outputs.append((str(src), str(dst)))
         if write_xmp:
             write_sidecar(src, k.score, k.flags, k.sharpness, k.exposure, k.faces)
