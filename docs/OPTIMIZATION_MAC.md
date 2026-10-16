@@ -17,7 +17,7 @@
 | 6 | 导出完成通知 + Dock 徽标 | ✅ 已实现 |
 | 7 | 在 Finder 中显示 | ✅ 已实现（`/api/reveal` + 灯箱按钮 + 卡片右键） |
 | 8 | 可撤销局部画笔 | ✅ 已实现（`local_region='brush'` + 前端 canvas 笔刷层 + 撤销/重做） |
-| 9 | 去噪/去模糊后端 | ⬜ 未做（P2 大项） |
+| 9 | 去噪/去模糊后端 | ✅ 已实现（NAFNet width32 SIDD 去噪，MIT，默认关闭手动触发） |
 | 10 | 经授权美学模型 | ✅ 已实现（idealo MobileNet Apache-2.0，`--ai` 恢复） |
 | 11 | 灯箱 EXIF 参数面板 | ✅ 已实现（`/api/exif` + `exif_summary()` + 灯箱 `lbExif`） |
 | 12 | 窗口标题随项目更新 | ✅ 已实现 |
@@ -124,6 +124,17 @@
   尚未接入；`--exclude-module onnxruntime` 的决定也要随之复盘。
 - **收益**：高 ISO 婚礼夜景、运动糊片起死回生；但须同步解决权重授权（见清单第 10 项教训）。
 - **改动范围**：大（模型选型 + 授权核实 + 推理管线 + UI）。
+- **实施（2026-10-14）**：接入 **NAFNet width32 SIDD 去噪**（MIT 代码+权重，
+  BasicSR Apache-2.0，PSNR 39.97 / SSIM 0.9599）。授权核实结论：官方权重
+  Google Drive/百度网盘受限，经 HuggingFace 镜像 `nyanko7/nafnet-models`
+  （官方权重原样托管）下载 `NAFNet-SIDD-width32.pth`（111MB），
+  `scripts/convert_nafnet.py` 复现架构并转 ONNX（`models/nafnet_sidd_width32.onnx`）。
+  新增 `photopilot/denoise.py`（懒加载 + 线程本地会话 + tile 分块重叠羽化融合，
+  模型缺失优雅降级）；`PolishParams` 新增 `ai_denoise`（0-1，默认 0），
+  前端「人像与局部」面板新增「AI 降噪」滑杆（带"较慢"提示，默认关闭、
+  手动触发，批量导出默认跳过）。去模糊（GoPro/REDS）因域特异性不匹配
+  婚礼/人像场景，暂不纳入；Restormer 因注意力对空间变化模糊弱且权重受限，
+  暂不选用。
 
 ### 10. 经授权的人脸/美学模型
 - **现状**：mediapipe（Apache-2.0）人脸可用；NIMA 美学权重因无授权停用

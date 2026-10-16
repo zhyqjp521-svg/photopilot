@@ -1,4 +1,6 @@
-# Model weights (Apache-2.0 idealo NIMA ONNX) stay out of sdist: large binary,
-# fetched/restored separately (see docs/THIRD_PARTY_LICENSES.md).
+# Model weights stay out of sdist: large binaries, fetched/restored separately
+# (see docs/THIRD_PARTY_LICENSES.md).
+#   - idealo NIMA aesthetic (Apache-2.0)  → nima_mobilenet_aesthetic_apache.onnx
+#   - NAFNet SIDD denoise (MIT)           → nafnet_sidd_width32.onnx
 prune photopilot/models
 prune models

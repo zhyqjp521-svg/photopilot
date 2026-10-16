@@ -39,10 +39,12 @@ class PolishParams:
     shadows: float = 0.0    # -1..1
     temperature: float = 0.0 # 相对冷暖，-1..1（不是 Kelvin）
     saturation: float = 0.0 # -1..1
+    ai_denoise: float = 0.0  # AI 降噪强度 0-1（NAFNet SIDD，默认关闭）
 
     def __post_init__(self):
         for name in ('wb', 'skin', 'retain', 'clarity', 'face_repair', 'blemish',
-                     'exposure', 'contrast', 'highlights', 'shadows', 'temperature', 'saturation'):
+                     'exposure', 'contrast', 'highlights', 'shadows', 'temperature',
+                     'saturation', 'ai_denoise'):
             value = float(getattr(self, name))
             limit = 3.0 if name == 'exposure' else 1.0
             lower = -limit if name in {'exposure', 'contrast', 'highlights', 'shadows', 'temperature', 'saturation'} else 0.0
@@ -469,6 +471,17 @@ def polish_image(img: np.ndarray, params: PolishParams | None = None,
     out = adjust_tone(out, exposure=p.exposure, contrast=p.contrast,
                       highlights=p.highlights, shadows=p.shadows,
                       temperature=p.temperature, saturation=p.saturation)
+
+    # AI 降噪（NAFNet SIDD）：先恢复干净基底，再做后续增强。默认关闭，
+    # 模型缺失时优雅跳过（denoise 返回 None）。在清晰度/磨皮之前执行，
+    # 避免后续锐化把噪声重新"打毛"。
+    if p.ai_denoise > 0:
+        from .denoise import denoise_strength
+        cleaned = denoise_strength(out, p.ai_denoise)
+        if cleaned is not None:
+            out = cleaned
+        elif warnings is not None:
+            warnings.append('AI 降噪模型不可用：已跳过降噪，其余调节仍生效。')
 
     if faces is None:
         from .face_analysis import analyze_faces

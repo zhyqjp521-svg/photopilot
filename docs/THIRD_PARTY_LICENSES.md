@@ -59,6 +59,21 @@ MediaPipe 框架及 Python solution 均为 Apache-2.0。人脸检测所用的
 > 历史遗留：早期曾提交一个来源不明的 NIMA ONNX（HuggingFace `cromsc/nima-mobilenet-aesthetic`，
 > 无明确许可），已于 2026-10-14 从工作区与 git 历史中彻底移除，由上述 Apache-2.0 权重取代。
 
+### 5. NAFNet 去噪权重 —— MIT（已核实）
+
+AI 降噪模型来自 **NAFNet**（"Simple Baselines for Image Restoration"，ECCV 2022，
+Megvii Research，https://github.com/megvii-research/NAFNet）。
+
+- 代码与权重均为 **MIT** 许可；训练管线部分移植自 BasicSR（Apache-2.0，
+  附带专利许可），SIDD 训练集（Smartphone Image Denoising Dataset）本身 MIT。
+- 权重：`NAFNet-SIDD-width32.pth`（SIDD 真实噪声去噪，PSNR 39.97 / SSIM 0.9599，
+  约 111MB），官方经 Google Drive/百度网盘发布；本项目从 HuggingFace 镜像
+  `nyanko7/nafnet-models`（官方权重原样托管）下载，由 `scripts/convert_nafnet.py`
+  一次性转为 ONNX（`models/nafnet_sidd_width32.onnx`），供 `denoise.py` 推理。
+- 该功能默认关闭、手动触发（AI 降噪是可选增强，不在批量导出默认流程中）。
+- 分发时保留 NAFNet 的 MIT LICENSE（Copyright (c) 2022 megvii-model）与
+  BasicSR 的 Apache-2.0 许可文本。
+
 ## 打包时的动作清单
 
 1. 锁定实际分发版本，导出递归依赖清单（`pip freeze` / `pip-licenses`）。

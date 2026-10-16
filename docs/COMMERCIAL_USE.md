@@ -24,7 +24,7 @@
 | CodeFormer | S-Lab 1.0 非商用；商业用途需联系贡献者 | 不纳入默认商业构建 |
 | GFPGAN | 主体 Apache-2.0，但许可文件包含第三方及非商用组件说明 | 不能仅凭仓库顶层 Apache 标记判定全部可商用，未接入 |
 | Restormer | 仓库代码 MIT | 候选去噪/去模糊；具体权重与数据仍待核实 |
-| NAFNet | 仓库许可及第三方组件需按所选版本核实 | 候选去噪/去模糊；具体权重与数据仍待核实 |
+| NAFNet | 代码与权重均 MIT；训练管线部分移植自 BasicSR（Apache-2.0） | ✅ 已接入去噪（width32，SIDD）；默认关闭、手动触发 |
 
 来源：[CodeFormer LICENSE](https://github.com/sczhou/CodeFormer/blob/master/LICENSE)、
 [GFPGAN LICENSE](https://github.com/TencentARC/GFPGAN/blob/master/LICENSE)、
@@ -49,3 +49,8 @@
 
 下一步优先：16-bit/ICC/RAW 显影参数 → 可撤销局部画笔 → 去噪/去模糊后端 → 经授权的人脸模型。
 每个深度后端分别核实代码、权重和附属组件；未经核实的资源不默认启用、不打包。
+
+> 更新（2026-10-14）：去噪后端已接入 **NAFNet（MIT）** width32 SIDD 真实噪声去噪，
+> 作为「AI 降噪」可选功能（默认关闭、手动触发）。去模糊（GoPro/REDS）权重同属 MIT，
+> 但因其域特异性（GoPro 运动糊/REDS 视频压缩）与婚礼/人像场景匹配度低，暂不纳入；
+> Restormer 因注意力对空间变化模糊较弱且权重下载受限，暂不选用。

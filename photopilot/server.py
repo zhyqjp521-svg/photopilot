@@ -629,7 +629,8 @@ def _prepare(payload: dict, *, retain_session=True) -> dict:
             highlights=float(payload.get("polish", {}).get("highlights", 0)),
             shadows=float(payload.get("polish", {}).get("shadows", 0)),
             temperature=float(payload.get("polish", {}).get("temperature", 0)),
-            saturation=float(payload.get("polish", {}).get("saturation", 0))),
+            saturation=float(payload.get("polish", {}).get("saturation", 0)),
+            ai_denoise=float(payload.get("polish", {}).get("ai_denoise", 0.0))),
         "paths": [str(p) for p in paths],
         "output_names": collision_safe_output_names((str(p) for p in paths),
                                                     preserve_raster=True),
@@ -745,7 +746,8 @@ def _render_session(ses: dict, payload: dict, *, output_destination=None) -> dic
     if not isinstance(adjustments, dict) or set(adjustments) - tone_keys:
         raise ValueError("未知调色参数")
     retouch = payload.get("retouch_adjustments", {})
-    retouch_keys = {'skin', 'retain', 'clarity', 'face_repair', 'blemish', 'local_region', 'brush_mask'}
+    retouch_keys = {'skin', 'retain', 'clarity', 'face_repair', 'blemish',
+                    'local_region', 'brush_mask', 'ai_denoise'}
     if not isinstance(retouch, dict) or set(retouch) - retouch_keys:
         raise ValueError("未知精修参数")
     brush_mask = None
@@ -3086,7 +3088,7 @@ const TONE_CONTROLS=[
   ['highlights','高光',-1,1,.05],['shadows','阴影',-1,1,.05],
   ['temperature','冷暖',-1,1,.05],['saturation','饱和度',-1,1,.05]
 ];
-const RETOUCH_CONTROLS=[['skin','磨皮'],['retain','纹理保留'],['clarity','清晰度'],['face_repair','人脸修复'],['blemish','瑕疵修复']];
+const RETOUCH_CONTROLS=[['skin','磨皮'],['retain','纹理保留'],['clarity','清晰度'],['face_repair','人脸修复'],['blemish','瑕疵修复'],['ai_denoise','AI 降噪']];
 const RETOUCH_KEYS=[...RETOUCH_CONTROLS.map(([key])=>key),'local_region','brush_mask'];
 const RETOUCH_REGIONS=['all','skin','face','eyes','background','brush'];
 function retouchValues(){return {...Object.fromEntries(RETOUCH_CONTROLS.map(([key])=>[key,+$('edit-retouch-'+key).value])),local_region:$('editRegion').value,brush_mask:CURRENT_EDITOR?.brushMask??null};}
@@ -3104,6 +3106,11 @@ function buildRetouchControls(editor){
     const input=row.querySelector('input');bindEditorGesture(input);
     input.oninput=()=>{slide(input,id+'-value');queueEditorRetouch();};
     $('editRetouchSliders').appendChild(row);slide(input,id+'-value');
+    if(key==='ai_denoise'){
+      const hint=document.createElement('div');hint.className='subhint';hint.id='aiDenoiseHint';
+      hint.textContent='AI 降噪（NAFNet）按整图运行，CPU 较慢，默认关闭；模型缺失时自动跳过。适合高 ISO / 暗光噪点明显的照片。';
+      $('editRetouchSliders').appendChild(hint);
+    }
   }
   $('editRegion').value=editor.retouch.local_region;
   $('editRegion').onchange=()=>{flushEditorGesture();queueEditorRetouch();flushEditorGesture();};
@@ -3296,7 +3303,7 @@ async function process(operation,retryPaths=null){
                 clarity:+$('clarity').value,wb:+$('wb').value,
                 face_repair:+$('faceRepair').value,blemish:+$('blemish').value,
                 local_region:$('localRegion').value,
-                auto_tone:$('autoTone').checked,...toneValues()};
+                auto_tone:$('autoTone').checked,ai_denoise:0,...toneValues()};
   let prep;
   flushEditorGesture();clearTimeout(editorTimer);hideEditorMask(CURRENT_EDITOR);CURRENT_EDITOR=null;
   const generation=++PROCESS_GEN;

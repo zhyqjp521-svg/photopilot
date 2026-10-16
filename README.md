@@ -102,7 +102,7 @@ Survey Mode，以及 digiKam 的相似度查找。许可证只约束被复制的
 
 **单张调节与导出**：选中一张，点「美化」或「套用预设」打开大图前后对比，可调
 曝光 EV、对比度、高光、阴影、冷暖、饱和度，并可实时调整磨皮、纹理保留、清晰度、
-人脸修复、瑕疵修复与局部区域。调节只生成预览，点「导出成品」才写
+人脸修复、瑕疵修复、**AI 降噪（NAFNet，默认关闭）**与局部区域。调节只生成预览，点「导出成品」才写
 最终文件。导出尺寸支持原始尺寸、4096/2560/2048px（不放大小图），JPEG 可选质量；
 PNG 保持 PNG。成品写入 `photopilot_out/<会话>/`，不同处理会话互不覆盖。可保存、载入
 原创 JSON 参数复用到批量处理；不是 Lightroom XMP/LUT 导入。
@@ -184,6 +184,7 @@ photopilot/
 ├── colorops.py       sRGB↔OKLab、色域压缩、肤色掩码（追色/美化共用）
 ├── face_analysis.py  MediaPipe FaceMesh：EAR 眨眼检测、关键点皮肤掩码、眼部定位
 ├── aesthetic.py      NIMA 美学评分（idealo MobileNet，Apache-2.0，ONNX）
+├── denoise.py        AI 降噪（NAFNet SIDD，MIT，ONNX，tile 分块，默认关闭）
 ├── cull.py           筛选引擎：多维打分 + 连拍分组（dHash）+ 闭眼重罚，线程池并行
 ├── color.py          追色：5 种算法 + 参考统计缓存 + 强度/保亮度/肤色保护 + 预设
 ├── polish.py         美化：白平衡 → 清晰度 → 频率分离磨皮 → 眼部
@@ -208,6 +209,7 @@ photopilot/
 | Reinhard 追色 | [hahnec/color-matcher](https://github.com/hahnec/color-matcher)、[dstein64/colortrans](https://github.com/dstein64/colortrans) | LAB 匹配；**另实现 OKLab 匹配（默认）、高斯最优传输线性映射(MKL)、逐通道 CDF、仅亮度 CDF** |
 | 色域安全 | 上游普遍硬裁剪 | **线性空间单步色度压缩**（向 Rec.709 亮度轴精确收缩）：实测修掉了"镜片反光变绿"这类色相破坏 |
 | 磨皮 | 商业修图软件的频率分离流程 | **引导滤波(He et al.)低频平滑 + 高频纹理按比例保留**，O(N) CPU 实时 |
+| AI 降噪 | [NAFNet](https://github.com/megvii-research/NAFNet)（ECCV 2022，MIT） | SIDD 真实噪声去噪权重转 ONNX 本地推理；tile 分块 + 重叠羽化融合；默认关闭、手动触发 |
 | 深度模型修脸 | [CodeFormer](https://github.com/sczhou/CodeFormer)、[facefusion](https://github.com/facefusion/facefusion) | 本仓库**未内置**（S-Lab 等许可禁止商用/需下权重）；见路线图接口 |
 
 ## 设计决策
@@ -239,7 +241,8 @@ photopilot/
 
 1. **16-bit 色彩与 RAW 编辑**：把曝光/白平衡前移到显影和线性光阶段，补齐 ICC 工作流。
 2. **手动局部画笔**：人脸/皮肤自动掩码之外，增加可撤销笔刷与蒙版可视化。
-3. **去噪/去模糊模型**：评估 NAFNet、Restormer 的具体权重、训练数据、商业授权与 M1 性能。
+3. **去噪/去模糊模型**：去噪已接入 **NAFNet width32（MIT，SIDD）**；去模糊（GoPro/REDS）
+   因域特异性与婚礼/人像场景匹配度低暂不纳入，Restormer 因注意力对空间变化模糊弱暂不选用。
 4. **人像深度修复**：仅在具体代码、权重和第三方组件许可都核实后接入；不默认使用 CodeFormer。
 5. **工程化**：增量图库、可取消导出队列、历史版本和更多真实相机 RAW 测试。
 

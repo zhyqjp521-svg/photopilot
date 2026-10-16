@@ -70,6 +70,8 @@ def _build_onedir() -> Path:
             "缺少美学模型 models/nima_mobilenet_aesthetic_apache.onnx：\n"
             "请先从 idealo/image-quality-assessment（Apache-2.0）下载 "
             "weights_mobilenet_aesthetic_0.07.hdf5 并转为 ONNX，或从发布包恢复。")
+    # NAFNet 去噪模型（可选）：缺失时打包仍继续，仅 AI 降噪功能不可用
+    denoise_model = ROOT / "models" / "nafnet_sidd_width32.onnx"
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean",
@@ -90,6 +92,15 @@ def _build_onedir() -> Path:
         "--exclude-module", "IPython",
         str(ENTRY),
     ]
+    if denoise_model.exists():
+        # AI 降噪（NAFNet SIDD）权重，denoise.py 同样按 models/ 定位
+        cmd.insert(cmd.index(str(ENTRY)),
+                   "--add-data")
+        cmd.insert(cmd.index(str(ENTRY)),
+                   f"{denoise_model}:models")
+    else:
+        print("提示：缺少 models/nafnet_sidd_width32.onnx，AI 降噪将不可用（其余功能正常）。",
+              flush=True)
     print("执行：", " ".join(cmd), flush=True)
     rc = subprocess.call(cmd, cwd=str(ROOT))
     if rc != 0:
