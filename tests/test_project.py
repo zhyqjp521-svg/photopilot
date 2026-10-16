@@ -161,10 +161,34 @@ class ProjectTests(unittest.TestCase):
 
     def test_oversized_disk_checkpoint_is_preserved(self):
         self.path.parent.mkdir()
-        self.path.write_bytes(b' ' * (16 * 1024 * 1024 + 1))
+        self.path.write_bytes(b' ' * (self.project.MAX_PROJECT_BYTES + 1))
         with self.assertRaises(ValueError):
             self.store.load()
-        self.assertEqual(self.path.stat().st_size, 16 * 1024 * 1024 + 1)
+        self.assertEqual(self.path.stat().st_size, self.project.MAX_PROJECT_BYTES + 1)
+
+    def test_large_library_and_windows_drive_paths_roundtrip(self):
+        # 回归：2 万张以上的项目曾因 MAX_PHOTOS=20000 保存失败；
+        # Windows 盘符路径（E:/…）在 POSIX 上曾被判为非绝对路径。
+        count = 21460
+        photos = [{'path': 'E:/Photos/wedding/dir%03d/IMG_%05d.CR3' % (i // 500, i),
+                   'width': 6000, 'height': 4000, 'score': .83,
+                   'sharpness': .7, 'exposure': .5, 'contrast': .5,
+                   'colorfulness': .5, 'faces': 2, 'blinks': 0,
+                   'group': i // 4, 'group_size': 4, 'group_rank': 1,
+                   'group_best': i % 4 == 0, 'rating': 3, 'ai': 4.2,
+                   'flags': ['pick']} for i in range(count)]
+        state = {'version': 1, 'folder': 'E:/Photos/wedding', 'photos': photos,
+                 'selected': [photos[0]['path']], 'target': photos[0]['path'],
+                 'settings': {}, 'drafts': {}}
+        result = self.store.save(state)
+        self.assertTrue(result['ok'])
+        loaded = self.store.load()
+        self.assertEqual(len(loaded['state']['photos']), count)
+        self.assertEqual(loaded['state']['folder'], 'E:/Photos/wedding')
+        # 超限仍拒绝
+        with self.assertRaises(ValueError):
+            self.store.save(dict(state, photos=[
+                dict(photos[0], path='/tmp/x.jpg') for _ in range(self.project.MAX_PHOTOS + 1)]))
 
     def test_concurrent_writes_always_leave_complete_valid_json(self):
         def save(index):
@@ -347,7 +371,7 @@ class ProjectHTTPTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), before)
 
     def test_http_project_limits_and_invalid_lengths_return_json(self):
-        self.assertEqual(self.request('POST', '', {'Content-Length': str(16 * 1024 * 1024 + 1)})[0], 413)
+        self.assertEqual(self.request('POST', '', {'Content-Length': str(server.MAX_PROJECT_BYTES + 1)})[0], 413)
         for length in ('invalid', '-1'):
             self.assertEqual(self.request('POST', '', {'Content-Length': length})[0], 400)
         self.assertEqual(self.request('POST', '{bad')[0], 400)

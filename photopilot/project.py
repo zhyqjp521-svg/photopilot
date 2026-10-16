@@ -13,8 +13,8 @@ from pathlib import Path
 
 from .xmp import read_rating
 
-MAX_PROJECT_BYTES = 16 * 1024 * 1024
-MAX_PHOTOS = 20000
+MAX_PROJECT_BYTES = 64 * 1024 * 1024
+MAX_PHOTOS = 100000
 MAX_DEPTH = 16
 _PROTOTYPE_KEYS = {'__proto__', 'prototype', 'constructor'}
 
@@ -66,11 +66,19 @@ def _bounded_json(value) -> None:
     visit(value, 0)
 
 
+def _is_abs_path(value: str) -> bool:
+    """绝对路径判定须跨平台：Windows 盘符路径（E:/…、E:\…）在 POSIX 下
+    也会被接受，避免 Windows 版保存的项目在 macOS 上无法加载。"""
+    if Path(value).is_absolute():
+        return True
+    return len(value) >= 3 and value[1] == ':' and value[2] in '/\\' and value[0].isascii() and value[0].isalpha()
+
+
 def _path(value, name: str, *, empty=False) -> str:
     if (not isinstance(value, str) or len(value) > 4096
             or any(ord(c) < 32 for c in value)
             or (not (empty and value == '') and
-                (not Path(value).is_absolute() or value.startswith('//')))):
+                (not _is_abs_path(value) or value.startswith('//')))):
         raise ValueError(f'project {name} must be an absolute local path')
     return value
 
