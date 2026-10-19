@@ -504,14 +504,14 @@ def main():
     check("rate API 返回 ok", r.get("ok") is True and r.get("rating") == 5)
     check("XMP sidecar 已写出", xmp_before.exists())
     if xmp_before.exists():
-        xt = xmp_before.read_text()
+        xt = xmp_before.read_text(encoding="utf-8")
         check("手动星级覆盖自动映射（5 星不随低分回退）",
               "<xmp:Rating>5</xmp:Rating>" in xt, xt.split("<xmp:Rating>")[1][:2] if "<xmp:Rating>" in xt else "?")
         check("手动星级 label 落 Keeper", "<xmp:Label>Keeper</xmp:Label>" in xt)
         check("XMP 软件版本与项目一致",
               f"PhotoPilot {__import__('photopilot').__version__}" in xt)
     r0 = S._rate({"path": str(target), "rating": 0, "score": 0.42})
-    xt0 = xmp_before.read_text()
+        xt0 = xmp_before.read_text(encoding="utf-8")
     check("0 星清除并落 Reject 档",
           r0.get("rating") == 0 and "<xmp:Rating>0</xmp:Rating>" in xt0
           and "<xmp:Label>Reject</xmp:Label>" in xt0)
@@ -539,7 +539,8 @@ def main():
     xmp_before.unlink(missing_ok=True)
     _x = _ws(target, 0.9, ["通过"], rating=None)   # 新 sidecar 仍按分数自动映射
     check("无人工评级时缺省自动映射不回归",
-          "<xmp:Rating>5</xmp:Rating>" in _x.read_text() and "<xmp:Label>Keeper</xmp:Label>" in _x.read_text())
+          "<xmp:Rating>5</xmp:Rating>" in _x.read_text(encoding="utf-8")
+          and "<xmp:Label>Keeper</xmp:Label>" in _x.read_text(encoding="utf-8"))
     xmp_before.unlink(missing_ok=True)
 
     # ---------------- 9. AI 美学评分（NIMA ONNX） ----------------
@@ -652,7 +653,7 @@ def main():
         check("scene_ref 流水线跑通并导出", len(res.outputs) >= 4,
               f"{len(res.outputs)} 张")
         import json as _json
-        rep = _json.loads((scene_dir / "report.json").read_text())
+        rep = _json.loads((scene_dir / "report.json").read_text(encoding="utf-8"))
         check("report 记录场景组数", rep["settings"]["scene_ref"] is True
               and rep["settings"]["scene_groups"] >= 1,
               f"groups={rep['settings']['scene_groups']}")

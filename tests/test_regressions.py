@@ -17,7 +17,7 @@ from unittest.mock import patch
 import numpy as np
 from PIL import Image
 
-from photopilot import io, server, polish
+from photopilot import io, server, polish, xmp
 from photopilot.cull import PhotoScore, finalize_cull, F_DUP
 from photopilot.xmp import read_rating, write_sidecar
 from photopilot import platform as platform_module
@@ -34,11 +34,13 @@ class SidecarTests(unittest.TestCase):
         self.sidecar = self.image.with_suffix(".xmp")
 
     def test_read_attribute_rating_with_arbitrary_namespace_prefix(self):
-        self.sidecar.write_text(f'<x xmlns="{RDF}" xmlns:stars="{XMP}"><Description stars:Rating="4"/></x>')
+        self.sidecar.write_text(f'<x xmlns="{RDF}" xmlns:stars="{XMP}"><Description stars:Rating="4"/></x>',
+                                encoding='utf-8')
         self.assertEqual(read_rating(self.image), 4)
 
     def test_rating_write_preserves_lightroom_adjustments_and_keywords(self):
-        self.sidecar.write_text(f'<x xmlns:rdf="{RDF}" xmlns:xmp="{XMP}" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" xmlns:dc="http://purl.org/dc/elements/1.1/"><rdf:RDF><rdf:Description crs:Exposure2012="1.25" xmp:Rating="2"><dc:subject><rdf:Bag><rdf:li>婚礼</rdf:li></rdf:Bag></dc:subject></rdf:Description></rdf:RDF></x>')
+        self.sidecar.write_text(f'<x xmlns:rdf="{RDF}" xmlns:xmp="{XMP}" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" xmlns:dc="http://purl.org/dc/elements/1.1/"><rdf:RDF><rdf:Description crs:Exposure2012="1.25" xmp:Rating="2"><dc:subject><rdf:Bag><rdf:li>婚礼</rdf:li></rdf:Bag></dc:subject></rdf:Description></rdf:RDF></x>',
+                                encoding='utf-8')
         write_sidecar(self.image, .6, [], rating=5)
         root = ET.parse(self.sidecar).getroot()
         desc = root.find(f'.//{{{RDF}}}Description')
@@ -52,10 +54,10 @@ class SidecarTests(unittest.TestCase):
 
     def test_invalid_existing_xmp_is_not_overwritten(self):
         original = '<unclosed Lightroom data'
-        self.sidecar.write_text(original)
+        self.sidecar.write_text(original, encoding='utf-8')
         with self.assertRaises(ValueError):
             write_sidecar(self.image, .5, [], rating=3)
-        self.assertEqual(self.sidecar.read_text(), original)
+        self.assertEqual(self.sidecar.read_text(encoding='utf-8'), original)
 
     def test_automatic_rescan_keeps_manual_rating(self):
         write_sidecar(self.image, .9, [], rating=5)
@@ -68,6 +70,13 @@ class SidecarTests(unittest.TestCase):
         self.assertIsNone(read_rating(self.image, manual_only=True))
         write_sidecar(self.image, .5, [], rating=4)
         self.assertEqual(read_rating(self.image, manual_only=True), 4)
+
+    def test_windows_sidecar_write_does_not_require_fchmod(self):
+        with (patch.object(xmp.os, 'fchmod',
+                           side_effect=AssertionError('fchmod is unavailable on Windows'))):
+            with patch.object(xmp, '_can_preserve_sidecar_mode', return_value=False):
+                write_sidecar(self.image, .9, [], rating=5)
+        self.assertEqual(read_rating(self.image, manual_only=True), 5)
 
 
 class ScanTests(unittest.TestCase):
@@ -368,7 +377,7 @@ class TrashTests(unittest.TestCase):
 
     def test_trash_moves_only_validated_images_and_their_xmp_sidecars(self):
         sidecar = self.first.with_suffix('.xmp')
-        sidecar.write_text('<x/>')
+        sidecar.write_text('<x/>', encoding='utf-8')
         moved = []
         with patch.object(server, '_move_to_trash', side_effect=lambda path: moved.append(Path(path))):
             result = server._trash_photos({'paths': [str(self.first)]})
@@ -378,14 +387,14 @@ class TrashTests(unittest.TestCase):
 
     def test_invalid_batch_is_rejected_before_any_file_is_moved(self):
         text = self.root / 'notes.txt'
-        text.write_text('not a photo')
+        text.write_text('not a photo', encoding='utf-8')
         with patch.object(server, '_move_to_trash') as move:
             with self.assertRaisesRegex(ValueError, '照片|图片|路径'):
                 server._trash_photos({'paths': [str(self.first), str(text)]})
         move.assert_not_called()
 
     def test_move_failures_are_reported_per_photo_and_sidecar_failure_is_a_warning(self):
-        self.first.with_suffix('.xmp').write_text('<x/>')
+        self.first.with_suffix('.xmp').write_text('<x/>', encoding='utf-8')
         moved = []
 
         def move(path):

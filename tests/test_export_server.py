@@ -112,7 +112,7 @@ class ExportServerTests(unittest.TestCase):
     def test_explicit_global_skin_setting_is_frozen(self):
         self.payload['settings']['polish']['global_skin'] = False
         self.submit()
-        stored = json.loads((self.root / 'exports.json').read_text())
+        stored = json.loads((self.root / 'exports.json').read_text(encoding='utf-8'))
         self.assertFalse(stored['jobs'][0]['recipe']['session']['params']['global_skin'])
 
     def test_restored_queue_uses_frozen_batch_white_balance_without_reprepare(self):
@@ -149,7 +149,7 @@ class ExportServerTests(unittest.TestCase):
         with patch.object(server, '_prepare', side_effect=AssertionError('retry must not reprepare')):
             self.queue.action(job['id'], 'retry')
             self.assertEqual(self.wait(job['id'])['state'], 'completed')
-        stored = json.loads((self.root / 'exports.json').read_text())
+        stored = json.loads((self.root / 'exports.json').read_text(encoding='utf-8'))
         self.assertEqual(stored['jobs'][0]['recipe']['session']['params']['exposure'], .1)
 
     def test_bad_settings_are_rejected_before_image_preparation(self):
@@ -204,6 +204,31 @@ class ExportServerTests(unittest.TestCase):
         self.assertEqual(self.wait(job['id'])['state'], 'failed')
         self.assertEqual(destination.read_bytes(), b'precious existing result')
         self.assertEqual(self.source.read_bytes(), self.original)
+
+    def test_windows_export_does_not_require_posix_directory_fd_apis(self):
+        job = self.submit()
+        with (patch.object(server, '_posix_directory_fd_available', return_value=False),
+              patch.object(server, '_posix_publish_export', side_effect=AssertionError(
+                  'POSIX publish path is unavailable on Windows'))):
+            self.queue.action(job['id'], 'resume')
+            done = self.wait(job['id'])
+        self.assertEqual(done['state'], 'completed', done)
+        with Image.open(done['items'][0]['result']['out']) as image:
+            self.assertEqual(image.size, (48, 32))
+
+    def test_windows_output_collision_never_overwrites_existing_file(self):
+        job = self.submit()
+        folder = self.root / 'photopilot_out' / job['id']
+        folder.mkdir(parents=True)
+        from photopilot.io import collision_safe_output_names
+        destination = folder / collision_safe_output_names([str(self.source)])[str(self.source)]
+        destination.write_bytes(b'precious existing result')
+        with patch.object(server, '_posix_directory_fd_available', return_value=False):
+            self.queue.action(job['id'], 'resume')
+            done = self.wait(job['id'])
+        self.assertEqual(done['state'], 'failed')
+        self.assertEqual(destination.read_bytes(), b'precious existing result')
+        self.assertEqual(list(folder.glob('.export-*')), [])
 
     def test_symlinked_output_parent_is_rejected_without_writing_outside_folder(self):
         job = self.submit()

@@ -1014,8 +1014,118 @@ def _submit_export(payload):
         return {'job': _public_export_job(queue.submit(recipe, prepared['paths'], payload['request_id']))}
 
 
+def _posix_directory_fd_available() -> bool:
+    """Whether the directory-relative no-follow publication APIs are available."""
+    return (os.name == 'posix'
+            and hasattr(os, 'O_DIRECTORY')
+            and hasattr(os, 'O_NOFOLLOW')
+            and hasattr(os, 'link')
+            and hasattr(os, 'unlink'))
+
+
+def _posix_publish_export(folder: Path, job_id: str, name: str,
+                          rendered: Path) -> Path:
+    """Atomically publish without following or overwriting output paths."""
+    destination = folder / 'photopilot_out' / job_id / name
+    descriptors = []
+    stage = None
+    try:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        folder_fd = os.open(folder, flags)
+        descriptors.append(folder_fd)
+        for component in ('photopilot_out', job_id):
+            try:
+                os.mkdir(component, mode=0o700, dir_fd=folder_fd)
+            except FileExistsError:
+                pass
+            folder_fd = os.open(component, flags, dir_fd=folder_fd)
+            descriptors.append(folder_fd)
+        stage = '.export-' + uuid.uuid4().hex + Path(name).suffix
+        fd = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=folder_fd)
+        with os.fdopen(fd, 'wb') as target, rendered.open('rb') as source:
+            while block := source.read(1024 * 1024):
+                target.write(block)
+            target.flush()
+            os.fsync(target.fileno())
+        if folder.resolve() != folder or destination.parent.resolve() != destination.parent:
+            raise ValueError('导出目录发生变化')
+        current = destination.parent.stat()
+        opened = os.fstat(folder_fd)
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError('导出目录发生变化')
+        # link(2) provides atomic no-clobber publication: it fails if the final
+        # name already exists. The stage and final name share one directory.
+        os.link(stage, name, src_dir_fd=folder_fd, dst_dir_fd=folder_fd,
+                follow_symlinks=False)
+        os.fsync(folder_fd)
+    finally:
+        if stage is not None:
+            try:
+                os.unlink(stage, dir_fd=descriptors[-1])
+            except FileNotFoundError:
+                pass
+        for fd in reversed(descriptors):
+            os.close(fd)
+    return destination
+
+
+def _windows_publish_export(folder: Path, job_id: str, name: str,
+                            rendered: Path, *, no_clobber: bool = False) -> Path:
+    """Publish on Windows without POSIX dir_fd APIs or clobbering a finished file.
+
+    Python on Windows lacks ``dir_fd`` support and ``O_NOFOLLOW``. Resolve and
+    re-check every directory before creating each component, then use exclusive
+    creation for the final destination. The check-then-create sequence is the
+    strongest portable guarantee available here; a concurrent attacker that can
+    replace directories must also have write access to the user's export folder.
+    """
+    if not folder.is_absolute() or folder.resolve(strict=True) != folder:
+        raise ValueError('导出目录发生变化')
+    output_root = folder / 'photopilot_out'
+    job_root = output_root / job_id
+    for directory in (output_root, job_root):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError('导出目录发生变化')
+        if directory.resolve() != directory:
+            raise ValueError('导出目录发生变化')
+    destination = job_root / name
+    stage = job_root / ('.export-' + uuid.uuid4().hex + Path(name).suffix)
+    try:
+        with rendered.open('rb') as source, stage.open('xb') as target:
+            while block := source.read(1024 * 1024):
+                target.write(block)
+            target.flush()
+            os.fsync(target.fileno())
+        # Windows Python's os.rename conventionally replaces an existing file.
+        # Callers can require an exclusive final name for extra Windows safety.
+        if job_root.resolve() != job_root or destination.parent.resolve() != destination.parent:
+            raise ValueError('导出目录发生变化')
+        if no_clobber:
+            with stage.open('rb') as source, destination.open('xb') as target:
+                while block := source.read(1024 * 1024):
+                    target.write(block)
+                target.flush()
+                os.fsync(target.fileno())
+        else:
+            os.rename(stage, destination)
+    finally:
+        stage.unlink(missing_ok=True)
+    return destination
+
+
+def _publish_export(folder: Path, job_id: str, name: str, rendered: Path) -> Path:
+    if _posix_directory_fd_available():
+        return _posix_publish_export(folder, job_id, name, rendered)
+    return _windows_publish_export(folder, job_id, name, rendered, no_clobber=True)
+
+
 def _render_export(job, item):
-    """Decode frozen settings, then publish with directory-relative no-clobber I/O."""
+    """Decode frozen settings, then publish with no-clobber I/O."""
     jid, recipe, path = job['id'], job['recipe'], item['path']
     if not isinstance(jid, str) or len(jid) != 32 or any(c not in '0123456789abcdef' for c in jid):
         raise ValueError('导出任务标识无效')
@@ -1028,51 +1138,14 @@ def _render_export(job, item):
     name = ses['output_names'].get(path)
     if name is None:
         raise ValueError('照片不在导出配方中')
-    destination = ses['folder'] / 'photopilot_out' / jid / name
     # Render inside a private temporary directory, never follow a replaced
     # output-directory symlink while the encoder is opening its target path.
     with tempfile.TemporaryDirectory(prefix='photopilot-export-') as temp:
         rendered = _render_session(ses, {'sid': jid, 'path': path},
                                    output_destination=Path(temp) / name)
         check_source()
-        descriptors = []
-        stage = None
-        try:
-            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-            folder_fd = os.open(ses['folder'], flags)
-            descriptors.append(folder_fd)
-            for component in ('photopilot_out', jid):
-                try:
-                    os.mkdir(component, mode=0o700, dir_fd=folder_fd)
-                except FileExistsError:
-                    pass
-                folder_fd = os.open(component, flags, dir_fd=folder_fd)
-                descriptors.append(folder_fd)
-            stage = '.export-' + uuid.uuid4().hex + Path(name).suffix
-            fd = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                         0o600, dir_fd=folder_fd)
-            with os.fdopen(fd, 'wb') as target, Path(rendered['out']).open('rb') as source:
-                while block := source.read(1024 * 1024):
-                    target.write(block)
-                target.flush()
-                os.fsync(target.fileno())
-            check_source()
-            if Path(ses['folder']).resolve() != ses['folder'] or destination.parent.resolve() != destination.parent:
-                raise ValueError('导出目录发生变化')
-            current = destination.parent.stat()
-            opened = os.fstat(folder_fd)
-            if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
-                raise ValueError('导出目录发生变化')
-            os.link(stage, name, src_dir_fd=folder_fd, dst_dir_fd=folder_fd, follow_symlinks=False)
-            os.fsync(folder_fd)
-        finally:
-            if stage is not None:
-                try:
-                    os.unlink(stage, dir_fd=descriptors[-1])
-                except FileNotFoundError:
-                    pass
-            for fd in reversed(descriptors):
-                os.close(fd)
+        destination = _publish_export(ses['folder'], jid, name, Path(rendered['out']))
+        check_source()
     return {'src': path, 'out': str(destination), 'width': rendered['width'], 'height': rendered['height']}
 
 

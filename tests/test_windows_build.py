@@ -26,6 +26,8 @@ class WindowsBuildTests(unittest.TestCase):
         self.assertIn(
             'python scripts/build_windows.py --allow-missing-aesthetic', workflow)
         self.assertIn('python -m unittest discover -s tests -v', workflow)
+        self.assertIn('npm install --no-save playwright-core', workflow)
+        self.assertIn("PLAYWRIGHT_CORE: '1'", workflow)
         self.assertIn('node tests/frontend_regressions.cjs', workflow)
         self.assertIn('PhotoPilot.exe cull', workflow)
         self.assertIn('PhotoPilot-*-windows-x64.zip', workflow)
@@ -70,6 +72,9 @@ class WindowsBuildTests(unittest.TestCase):
             if arg == '--exclude-module'
         }
         self.assertNotIn('matplotlib', excluded)
+        self.assertNotIn('clr_loader', excluded)
+        self.assertNotIn('pythonnet', excluded)
+        self.assertNotIn('AppKit', excluded)
 
     def test_present_aesthetic_model_is_collected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -98,7 +103,6 @@ class WindowsBuildTests(unittest.TestCase):
                 with_icon = builder._build_command('PhotoPilot', console=False)
             self.assertIn('--icon', with_icon)
             self.assertIn(str(icon), with_icon)
-
 
 if __name__ == '__main__':
     unittest.main()

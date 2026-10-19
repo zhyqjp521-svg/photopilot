@@ -63,9 +63,10 @@ class ExportQueueTests(unittest.TestCase):
         self.assertNotIn('recipe', job)
         self.assertNotIn('request_id', job)
         self.assertNotIn('fingerprint', job['items'][0])
-        raw = json.loads(self.path.read_text())
+        raw = json.loads(self.path.read_text(encoding='utf-8'))
         self.assertEqual(raw['jobs'][0]['recipe']['tone']['exposure'], .4)
-        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        if os.name != 'nt':
+            self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
         job['items'].clear()
         self.assertEqual(len(q.get(job['id'])['items']), 1)
 
@@ -199,7 +200,7 @@ class ExportQueueTests(unittest.TestCase):
     def test_serial_renderer_success_persisted_and_never_retried(self):
         calls = []
         def renderer(job, item):
-            raw = json.loads(self.path.read_text())
+            raw = json.loads(self.path.read_text(encoding='utf-8'))
             stored = next(j for j in raw['jobs'] if j['id'] == job['id'])
             self.assertEqual(stored['items'][item['index']]['state'], 'running')
             calls.append(item['path'])
@@ -211,7 +212,7 @@ class ExportQueueTests(unittest.TestCase):
         self.assertEqual(job['counts']['succeeded'], 3)
         q.action(jid, 'retry')
         self.assertEqual(len(calls), 3)
-        self.assertEqual(json.loads(self.path.read_text())['jobs'][0]['recipe']['tone']['exposure'], .4)
+        self.assertEqual(json.loads(self.path.read_text(encoding='utf-8'))['jobs'][0]['recipe']['tone']['exposure'], .4)
 
     def test_pause_retry_failed_only_and_pending(self):
         entered, release = threading.Event(), threading.Event()
@@ -244,10 +245,10 @@ class ExportQueueTests(unittest.TestCase):
     def test_restore_is_paused_and_requires_explicit_resume(self):
         q = self.queue(autostart=False)
         jid = self.submit(q)['id']
-        raw = json.loads(self.path.read_text())
+        raw = json.loads(self.path.read_text(encoding='utf-8'))
         raw['jobs'][0]['state'] = 'running'
         raw['jobs'][0]['items'][0]['state'] = 'running'
-        self.path.write_text(json.dumps(raw))
+        self.path.write_text(json.dumps(raw), encoding='utf-8')
         calls = []
         restored = self.queue(lambda j, i: calls.append(i['path']) or {'out': '/tmp/result'})
         self.assertEqual(restored.get(jid)['state'], 'paused')
@@ -265,10 +266,10 @@ class ExportQueueTests(unittest.TestCase):
                 recipe = {'tone': {'exposure': .4}}
                 jid = self.submit(q, recipe)['id']
                 if saved_state == 'running':
-                    raw = json.loads(self.path.read_text())
+                    raw = json.loads(self.path.read_text(encoding='utf-8'))
                     raw['jobs'][0]['state'] = 'running'
                     raw['jobs'][0]['items'][0]['state'] = 'running'
-                    self.path.write_text(json.dumps(raw))
+                    self.path.write_text(json.dumps(raw), encoding='utf-8')
                 before = self.path.read_bytes()
                 recipe['tone']['exposure'] = 99
                 calls = []
@@ -293,7 +294,7 @@ class ExportQueueTests(unittest.TestCase):
                 self.assertEqual(job['counts']['succeeded'], 3)
                 self.assertEqual(calls, [(index, {'tone': {'exposure': .4}}) for index in range(3)])
                 self.assertIsNone(restored.error)
-                self.assertEqual(json.loads(self.path.read_text())['jobs'][0]['recipe'],
+                self.assertEqual(json.loads(self.path.read_text(encoding='utf-8'))['jobs'][0]['recipe'],
                                  {'tone': {'exposure': .4}})
                 restored.shutdown(2)
 
@@ -345,7 +346,7 @@ class ExportQueueTests(unittest.TestCase):
             release.set()
             self.wait(q, jid, lambda j: bool(j.get('queue_error')))
         self.assertEqual(calls, [0])
-        self.assertEqual(json.loads(self.path.read_text())['jobs'][0]['items'][0]['state'], 'running')
+        self.assertEqual(json.loads(self.path.read_text(encoding='utf-8'))['jobs'][0]['items'][0]['state'], 'running')
 
     def test_action_save_failure_stays_latched_after_active_render_finishes(self):
         entered, release = threading.Event(), threading.Event()
@@ -579,10 +580,16 @@ class ExportQueueTests(unittest.TestCase):
         self.assertEqual(calls, [0])
 
     def test_default_location_and_environment(self):
-        with patch.dict(os.environ, {}, clear=True), patch.object(Path, 'home', return_value=self.root):
+        if os.name == 'nt':
+            expected = self.root / 'AppData/Roaming/PhotoPilot/exports.json'
+            environment = {'APPDATA': str(self.root / 'AppData/Roaming')}
+        else:
+            expected = self.root / 'Library/Application Support/PhotoPilot/exports.json'
+            environment = {}
+        with patch.dict(os.environ, environment, clear=True), patch.object(Path, 'home', return_value=self.root):
             q = self.module.ExportQueue(autostart=False)
             self.addCleanup(q.shutdown)
-            self.assertEqual(q.path, self.root / 'Library/Application Support/PhotoPilot/exports.json')
+            self.assertEqual(q.path, expected)
         with patch.dict(os.environ, {'PHOTOPILOT_EXPORT_PATH': str(self.path)}):
             q = self.module.ExportQueue(autostart=False)
             self.addCleanup(q.shutdown)
@@ -603,7 +610,7 @@ class ExportQueueTests(unittest.TestCase):
     def test_inconsistent_completed_checkpoint_rejected(self):
         q = self.queue(autostart=False)
         self.submit(q)
-        raw = json.loads(self.path.read_text())
+        raw = json.loads(self.path.read_text(encoding='utf-8'))
         raw['jobs'][0]['state'] = 'completed'
         before = json.dumps(raw).encode()
         self.path.write_bytes(before)

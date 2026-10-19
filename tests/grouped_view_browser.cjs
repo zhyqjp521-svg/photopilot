@@ -4,7 +4,7 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const os=require('node:os');
 const path=require('node:path');
-const {chromium}=require('playwright');
+const {chromium}=process.env.PLAYWRIGHT_CORE?(require('playwright-core')):(require('playwright'));
 async function main(){
   const source=fs.readFileSync(path.join(__dirname,'../photopilot/server.py'),'utf8');
   const html=source.split('INDEX_HTML = r"""')[1].split('</html>')[0]+'</html>';
@@ -24,7 +24,8 @@ async function main(){
     flags:[],score:.9-i*.02,rating:0,group:i<3?1:i<5?2:i<9?3:10+i,
     group_size:i<3?3:i<5?2:i<9?4:1,group_rank:i<3?i+1:i<5?i-2:i<9?i-4:1,
     group_best:[0,3,5,9,10,11].includes(i)}));
-  const browser=await chromium.launch({headless:true,executablePath:'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'});
+  const browser=await chromium.launch({headless:true,channel:process.platform==='win32'?'msedge':undefined,
+    executablePath:process.platform==='win32'?undefined:'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'});
   const output=fs.mkdtempSync(path.join(os.tmpdir(),'photopilot-groups-'));
   try{
     const page=await browser.newPage({viewport:{width:1440,height:920}});

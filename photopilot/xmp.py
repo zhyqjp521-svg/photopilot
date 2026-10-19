@@ -44,6 +44,11 @@ for _prefix, _uri in (("x", "adobe:ns:meta/"), ("rdf", RDF_NS),
 _WRITE_LOCK = threading.RLock()
 
 
+def _can_preserve_sidecar_mode() -> bool:
+    """Only POSIX supports fchmod; Windows keeps its ACL-derived file mode."""
+    return os.name == 'posix' and hasattr(os, 'fchmod')
+
+
 def _property(root: ET.Element, ns: str, name: str) -> str | None:
     tag = f"{{{ns}}}{name}"
     for node in root.iter():
@@ -155,7 +160,7 @@ def write_sidecar(image_path: str | Path, score: float, flags: list[str],
             with tempfile.NamedTemporaryFile(dir=xmp_path.parent, prefix=f".{xmp_path.name}.",
                                              suffix=".tmp", delete=False) as handle:
                 temporary = Path(handle.name)
-                if xmp_path.exists():
+                if _can_preserve_sidecar_mode() and xmp_path.exists():
                     os.fchmod(handle.fileno(), xmp_path.stat().st_mode & 0o777)
                 handle.write(data)
                 handle.flush()

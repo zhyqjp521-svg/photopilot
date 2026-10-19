@@ -1,10 +1,11 @@
 // Isolated browser fixture: no requests reach the user's running app or files.
 const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
-const {chromium}=require('playwright');
+const {chromium}=process.env.PLAYWRIGHT_CORE?(require('playwright-core')):(require('playwright'));
 async function main(){
   const source=fs.readFileSync(path.join(__dirname,'../photopilot/server.py'),'utf8');
   const html=source.split('INDEX_HTML = r"""')[1].split('</html>')[0]+'</html>';
-  const browser=await chromium.launch({headless:true,executablePath:'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'});
+  const browser=await chromium.launch({headless:true,channel:process.platform==='win32'?'msedge':undefined,
+    executablePath:process.platform==='win32'?undefined:'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'});
   const errors=[],writes=[];let saved=null;
   try{
     const page=await browser.newPage({viewport:{width:1440,height:1000}});

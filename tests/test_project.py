@@ -69,7 +69,7 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(photo['group'], -1)
         self.assertNotIn('_fingerprint', photo)
         self.assertEqual(self.original.read_bytes(), before)
-        self.assertEqual(json.loads(self.path.read_text())['photos'][0]['_fingerprint'],
+        self.assertEqual(json.loads(self.path.read_text(encoding='utf-8'))['photos'][0]['_fingerprint'],
                          {'size': self.original.stat().st_size,
                           'mtime_ns': self.original.stat().st_mtime_ns})
 
@@ -281,7 +281,7 @@ class ProjectTests(unittest.TestCase):
             self.assertEqual(self.store.load()['missing'], [])
         with ThreadPoolExecutor(max_workers=6) as pool:
             list(pool.map(save, range(24)))
-        self.assertIn(json.loads(self.path.read_text())['settings']['index'], range(24))
+        self.assertIn(json.loads(self.path.read_text(encoding='utf-8'))['settings']['index'], range(24))
         self.assertEqual(list(self.path.parent.iterdir()), [self.path])
 
 
@@ -321,8 +321,10 @@ class ScanCheckpointIntegrationTests(unittest.TestCase):
 
     def test_relative_folder_and_tilde_folder_scans_can_be_checkpointed(self):
         demo = self._images()
-        with contextlib.chdir(self.root), patch.dict(os.environ, {'HOME': str(self.root)}), \
-                patch.object(server, 'THUMB_DIR', self.root / 'cache'):
+        with (contextlib.chdir(self.root),
+              patch.dict(os.environ, {'HOME': str(self.root), 'USERPROFILE': str(self.root)}),
+              patch.object(Path, 'home', return_value=self.root),
+              patch.object(server, 'THUMB_DIR', self.root / 'cache')):
             for folder in ('./demo', '~/demo'):
                 with self.subTest(folder=folder):
                     started, photos = self._scan_and_checkpoint({'folder': folder})
