@@ -3,6 +3,9 @@ $ErrorActionPreference = 'Stop'
 $sample = Join-Path $env:RUNNER_TEMP ("photopilot-smoke-" + [guid]::NewGuid().ToString('N'))
 $export = Join-Path $sample 'export'
 $env:PHOTOPILOT_PROJECT_PATH = Join-Path $sample 'project.json'
+$env:LOCALAPPDATA = Join-Path $sample 'local-appdata'
+$env:APPDATA = Join-Path $sample 'appdata'
+$env:USERPROFILE = Join-Path $sample 'user'
 New-Item -ItemType Directory -Force -Path $sample | Out-Null
 python -c "from PIL import Image; Image.new('RGB', (1600, 1000), (35, 120, 205)).save(r'$sample\import-test.jpg')"
 
@@ -36,12 +39,19 @@ $products = @(Get-ChildItem $export -File | Where-Object { $_.Extension -in '.jp
 if ($products.Count -ne 1) { throw "Expected one exported JPEG, got $($products.Count)" }
 if ($products[0].Length -le 10000) { throw 'Exported JPEG is unexpectedly small' }
 
+$env:PHOTOPILOT_SMOKE_PHOTO = $source
+$env:PHOTOPILOT_SMOKE_OUT = $sample
+$env:PHOTOPILOT_SMOKE_PORT = '18765'
+& ./tests/windows_ui_probe.ps1
+if ($LASTEXITCODE -ne 0) { throw "Packaged UI probe exited with $LASTEXITCODE" }
+
 @{
   source = $sample
   image = (Join-Path $sample 'import-test.jpg')
   report = $json
   export = $products[0].FullName
   export_bytes = $products[0].Length
+  ui_import = (Join-Path $sample 'ui-smoke.json')
   exe_sha256 = (Get-FileHash .\dist\PhotoPilot.exe -Algorithm SHA256).Hash
 } | ConvertTo-Json | Set-Content (Join-Path $sample 'smoke.json') -Encoding utf8
 Get-Content (Join-Path $sample 'smoke.json')

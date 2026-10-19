@@ -41,6 +41,12 @@ class WindowsBuildTests(unittest.TestCase):
         self.assertIn('Start-Process', smoke)
         self.assertIn('-Wait', smoke)
         self.assertIn('Exported JPEG is unexpectedly small', smoke)
+        self.assertIn('windows_ui_probe.ps1', smoke)
+        ui_smoke = (Path(__file__).resolve().parents[1] / 'tests/windows_ui_smoke.py').read_text(
+            encoding='utf-8')
+        self.assertIn('/api/import_paths', ui_smoke)
+        self.assertIn('/api/scan_status', ui_smoke)
+        self.assertIn("host='evil.example'", ui_smoke)
 
     def test_missing_aesthetic_requires_explicit_opt_in(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(builder, 'ROOT', Path(tmp)):
