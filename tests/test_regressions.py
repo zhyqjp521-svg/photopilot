@@ -72,10 +72,14 @@ class SidecarTests(unittest.TestCase):
         self.assertEqual(read_rating(self.image, manual_only=True), 4)
 
     def test_windows_sidecar_write_does_not_require_fchmod(self):
-        with (patch.object(xmp.os, 'fchmod',
-                           side_effect=AssertionError('fchmod is unavailable on Windows'))):
-            with patch.object(xmp, '_can_preserve_sidecar_mode', return_value=False):
-                write_sidecar(self.image, .9, [], rating=5)
+        # Create an existing sidecar so a broken implementation would reach its
+        # mode-preservation branch. fchmod is absent on real Windows, so patch
+        # the platform predicate rather than trying to mock a missing attribute.
+        self.sidecar.write_text(
+            f'<x xmlns:rdf="{RDF}"><rdf:RDF><rdf:Description/></rdf:RDF></x>',
+            encoding='utf-8')
+        with patch.object(xmp, '_can_preserve_sidecar_mode', return_value=False):
+            write_sidecar(self.image, .9, [], rating=5)
         self.assertEqual(read_rating(self.image, manual_only=True), 5)
 
 
