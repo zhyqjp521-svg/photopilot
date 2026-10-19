@@ -1,4 +1,5 @@
 .venv/
+.venv-build/
 __pycache__/
 *.pyc
 demo/out/
@@ -11,6 +12,7 @@ demo/bench_big.jpg
 *.egg-info/
 build/
 dist/
+/PhotoPilot.spec
 .DS_Store
 models/
 demo/ui_demo/

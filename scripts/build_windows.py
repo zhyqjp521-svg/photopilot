@@ -38,6 +38,11 @@ for _stream in (sys.stdout, sys.stderr):
 
 ROOT = Path(__file__).resolve().parent.parent
 ENTRY = ROOT / "run_photopilot.py"
+OPTIONAL_APP_DATA = (
+    ('models/nima_mobilenet_aesthetic_apache.onnx', 'models'),
+    ('models/nafnet_sidd_width32.onnx', 'models'),
+    ('scripts/PhotoPilot.ico', '.'),
+)
 
 
 def _banner(msg: str) -> None:
@@ -72,26 +77,32 @@ def _ensure_deps() -> None:
             sys.exit(f"缺少依赖 {hint}：请先执行 `pip install -e .`")
 
 
-def _build_command(name: str, console: bool) -> list[str]:
+def _build_command(name: str, console: bool, *,
+                   allow_missing_aesthetic: bool = False) -> list[str]:
     """构造 PyInstaller 命令行。
 
     用命令行而非 .spec：交给 PyInstaller 自己管理内部 TOC，避免手写 spec
     在不同 PyInstaller 版本间的兼容问题。
 
     --collect-all mediapipe   收集内置 tflite 人脸模型与子模块（缺了人脸检测会失效）
-    --collect-all onnxruntime 收集原生推理库（NIMA 美学评分）
-    --add-data models/...     美学模型权重（Apache-2.0 idealo MobileNet）
+    --collect-data onnxruntime 与 --collect-binaries 收集推理库，避免把训练工具也打进来
+    --add-data models/...     可选美学/降噪模型权重；缺失时其余功能正常
+    --hidden-import webview   pywebview 动态选择 WinForms + EdgeChromium 后端
     --collect-data cv2        收集 haarcascade 级联数据
     --collect-data rawpy      收集 LibRaw 附带数据
     --collect-submodules send2trash  Windows/Linux 回收站
     """
     window_flag = "--console" if console else "--windowed"
     model = ROOT / "models" / "nima_mobilenet_aesthetic_apache.onnx"
-    if not model.exists():
+    if not model.exists() and not allow_missing_aesthetic:
         sys.exit(
             "缺少美学模型 models/nima_mobilenet_aesthetic_apache.onnx：\n"
             "请先从 idealo/image-quality-assessment（Apache-2.0）下载 "
-            "weights_mobilenet_aesthetic_0.07.hdf5 并转为 ONNX，或从发布包恢复。")
+            "weights_mobilenet_aesthetic_0.07.hdf5 并转为 ONNX，或从发布包恢复。\n"
+            "若构建没有美学权重的社区版，请显式加 --allow-missing-aesthetic。")
+    if not model.exists():
+        print("提示：本次明确跳过缺失的美学评分模型；传统评分及其他功能仍可使用。",
+              flush=True)
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean",
@@ -99,17 +110,25 @@ def _build_command(name: str, console: bool) -> list[str]:
         window_flag,
         "--name", name,
         "--collect-all", "mediapipe",
-        "--collect-all", "onnxruntime",
-        "--add-data", f"{model};models",
+        "--collect-data", "onnxruntime",
+        "--collect-binaries", "onnxruntime",
+        "--hidden-import", "webview.platforms.winforms",
+        "--hidden-import", "webview.platforms.edgechromium",
+        "--hidden-import", "webview.platforms.win32",
+        "--hidden-import", "pythonnet",
+        "--hidden-import", "clr_loader",
         "--collect-data", "cv2",
         "--collect-data", "rawpy",
         "--collect-submodules", "send2trash",
-        "--exclude-module", "matplotlib",
         "--exclude-module", "tkinter",
         "--exclude-module", "pandas",
         "--exclude-module", "IPython",
+        "--exclude-module", "onnxruntime.quantization",
+        "--exclude-module", "onnxruntime.tools",
         str(ENTRY),
     ]
+    if model.exists():
+        cmd[-1:-1] = ["--add-data", f"{model};models"]
     denoise_model = ROOT / "models" / "nafnet_sidd_width32.onnx"
     if denoise_model.exists():
         # AI 降噪（NAFNet SIDD）权重，denoise.py 同样按 models/ 定位
@@ -118,6 +137,9 @@ def _build_command(name: str, console: bool) -> list[str]:
     else:
         print("提示：缺少 models/nafnet_sidd_width32.onnx，AI 降噪将不可用（其余功能正常）。",
               flush=True)
+    icon = ROOT / 'scripts/PhotoPilot.ico'
+    if icon.is_file():
+        cmd[-1:-1] = ['--icon', str(icon)]
     return cmd
 
 
@@ -126,6 +148,8 @@ def main() -> int:
     ap.add_argument("--console", action="store_true",
                     help="附带生成一个带控制台的排障版 exe")
     ap.add_argument("--clean", action="store_true", help="构建前清理 build/ 缓存")
+    ap.add_argument("--allow-missing-aesthetic", action="store_true",
+                    help="明确允许缺少美学评分模型，保留传统评分与其他功能")
     args = ap.parse_args()
 
     _check_platform()
@@ -139,7 +163,8 @@ def main() -> int:
             shutil.rmtree(ROOT / d, ignore_errors=True)
 
     _banner("打包 PhotoPilot.exe（x64，单文件，无控制台）")
-    cmd = _build_command("PhotoPilot", console=False)
+    cmd = _build_command("PhotoPilot", console=False,
+                         allow_missing_aesthetic=args.allow_missing_aesthetic)
     print("执行：", " ".join(cmd), flush=True)
     rc = subprocess.call(cmd, cwd=str(ROOT))
     if rc != 0:
@@ -147,7 +172,9 @@ def main() -> int:
 
     if args.console:
         _banner("生成排障版（带控制台，PhotoPilot-console.exe）")
-        rc2 = subprocess.call(_build_command("PhotoPilot-console", console=True),
+        rc2 = subprocess.call(_build_command(
+                                  "PhotoPilot-console", console=True,
+                                  allow_missing_aesthetic=args.allow_missing_aesthetic),
                               cwd=str(ROOT))
         if rc2 != 0:
             print(f"警告：排障版打包失败（返回码 {rc2}），主产物仍可用", flush=True)

@@ -8,7 +8,7 @@
 - 美化：引导滤波(He et al.) 频率分离磨皮 + 自动白平衡 + 局部清晰度
 """
 
-__version__ = "0.3.0"
+__version__ = "0.3.3"
 
 from .io import load_image, save_image, resize_max, iter_images, RAW_EXTS, IMG_EXTS
 from .cull import cull_folder, CullReport, PhotoScore, smart_rank

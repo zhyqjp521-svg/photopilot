@@ -40,16 +40,56 @@ jobs:
       - name: Verify package imports
         run: python -c "import photopilot; print('PhotoPilot', photopilot.__version__)"
 
+      - name: Run Python tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Run frontend regression tests
+        run: |
+          node tests/frontend_regressions.cjs
+          node tests/grouped_view_browser.cjs
+          node tests/size_filter_browser.cjs
+          node tests/review_workspace_browser.cjs
+          node tests/brush_reliability_browser.cjs
+
       - name: Build PhotoPilot.exe
-        run: python scripts/build_windows.py
+        run: python scripts/build_windows.py --allow-missing-aesthetic
+
+      - name: Smoke-test packaged EXE with a real photo import
+        shell: pwsh
+        run: |
+          $sample = Join-Path $env:RUNNER_TEMP 'photopilot-smoke'
+          New-Item -ItemType Directory -Force -Path $sample | Out-Null
+          python -c "from PIL import Image; Image.new('RGB', (1600, 1000), (35, 120, 205)).save(r'$sample\import-test.jpg')"
+          $json = Join-Path $sample 'report.json'
+          & .\dist\PhotoPilot.exe cull $sample --no-faces --json $json
+          if ($LASTEXITCODE -ne 0) { throw "Packaged EXE cull exited with $LASTEXITCODE" }
+          $report = Get-Content $json -Raw | ConvertFrom-Json
+          if ($report.photos.Count -ne 1) { throw "Expected one imported photo, got $($report.photos.Count)" }
+          if (-not (Test-Path (Join-Path $sample 'import-test.jpg'))) { throw "Smoke fixture was unexpectedly removed" }
+          @{
+            source = $sample
+            image = (Join-Path $sample 'import-test.jpg')
+            report = $json
+            exe_sha256 = (Get-FileHash .\dist\PhotoPilot.exe -Algorithm SHA256).Hash
+          } | ConvertTo-Json | Set-Content (Join-Path $sample 'smoke.json') -Encoding utf8
+          Get-Content (Join-Path $sample 'smoke.json')
 
       - name: Show output
         run: dir dist
 
-      - name: Upload EXE
+      - name: Package Windows build
+        shell: pwsh
+        run: |
+          $version = python -c "import photopilot; print(photopilot.__version__)"
+          Compress-Archive -Path dist\PhotoPilot.exe -DestinationPath "dist\PhotoPilot-$version-windows-x64.zip" -Force
+          Get-FileHash "dist\PhotoPilot-$version-windows-x64.zip" -Algorithm SHA256 | Format-List
+
+      - name: Upload Windows build
         uses: actions/upload-artifact@v4
         with:
           name: PhotoPilot-windows-x64
-          path: dist/PhotoPilot.exe
+          path: |
+            dist/PhotoPilot-*-windows-x64.zip
+            dist/PhotoPilot.exe
           if-no-files-found: error
           retention-days: 30

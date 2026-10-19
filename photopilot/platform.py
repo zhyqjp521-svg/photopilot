@@ -151,9 +151,22 @@ def dock_badge(text: str | None) -> None:
     if not IS_MACOS:
         return
     try:
-        from AppKit import NSApplication
-        tile = NSApplication.sharedApplication().dockTile()
-        tile.setBadgeLabel_(text if text else None)
+        from Foundation import NSOperationQueue, NSThread
+
+        def update():
+            try:
+                from AppKit import NSApplication
+                tile = NSApplication.sharedApplication().dockTile()
+                tile.setBadgeLabel_(text if text else None)
+            except Exception:
+                pass
+
+        # The progress worker may run before pywebview initializes AppKit.
+        # Creating NSApplication there corrupts the main event queue on macOS.
+        if NSThread.isMainThread():
+            update()
+        else:
+            NSOperationQueue.mainQueue().addOperationWithBlock_(update)
     except Exception:
         pass
 

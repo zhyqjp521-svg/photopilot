@@ -104,6 +104,7 @@ async function main(){
     await page.screenshot({path:path.join(output,'wide.png')});
     await page.selectOption('#filterMode','starred');
     assert.match(await page.locator('#scanInfo').innerText(),/当前可见已选 0.*全部已选 2/);
+    await page.locator('#reviewTools summary').first().click();
     assert.match(await page.locator('#batchSelectionCount').innerText(),/全部已选 2.*当前可见 0.*隐藏 2/);
     const confirmations=[];page.on('dialog',dialog=>{confirmations.push(dialog.message());dialog.dismiss();});
     const before=writes.length;

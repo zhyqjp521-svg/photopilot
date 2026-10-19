@@ -329,7 +329,7 @@ def _local_mask(img: np.ndarray, faces: list, region: str,
         return np.ones(img.shape[:2], np.float32)
     if region == "brush":
         if brush_mask is None:
-            return np.ones(img.shape[:2], np.float32)
+            return np.zeros(img.shape[:2], np.float32)
         mask = np.asarray(brush_mask, np.float32)
         if mask.shape[:2] != img.shape[:2]:
             mask = cv2.resize(mask, (img.shape[1], img.shape[0]),

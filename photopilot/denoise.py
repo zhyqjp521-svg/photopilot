@@ -107,6 +107,13 @@ def denoise(img: np.ndarray, tile_size: int = 512, overlap: int = 32) -> np.ndar
         return None
     if img.dtype != np.uint8 or img.ndim != 3 or img.shape[-1] != 3:
         raise ValueError("denoise 需要 RGB uint8 图像")
+    if (isinstance(tile_size, (bool, np.bool_))
+            or not isinstance(tile_size, (int, np.integer)) or tile_size <= 0):
+        raise ValueError("tile_size 必须为正整数")
+    if (isinstance(overlap, (bool, np.bool_))
+            or not isinstance(overlap, (int, np.integer))
+            or not 0 <= overlap < tile_size):
+        raise ValueError("overlap 必须为满足 0 <= overlap < tile_size 的整数")
 
     h, w = img.shape[:2]
     f = img.astype(np.float32) / 255.0
@@ -120,7 +127,7 @@ def denoise(img: np.ndarray, tile_size: int = 512, overlap: int = 32) -> np.ndar
     # 大图分块，重叠加权融合
     out = np.zeros_like(f)
     weight = np.zeros((h, w), np.float32)
-    step = max(1, tile_size - overlap)
+    step = tile_size - overlap
     # 重叠区的线性羽化权重（沿 x/y 独立）
     for y0 in range(0, h, step):
         for x0 in range(0, w, step):
@@ -135,14 +142,19 @@ def denoise(img: np.ndarray, tile_size: int = 512, overlap: int = 32) -> np.ndar
             wy = np.ones(th, np.float32)
             wx = np.ones(tw, np.float32)
             if overlap > 0:
+                # 最后一块可能比 overlap 更窄；羽化长度必须匹配实际尺寸。
+                # 权重保持正数，单像素边界及大重叠也不会留下未覆盖像素。
+                fy, fx = min(overlap, th), min(overlap, tw)
+                ry = np.linspace(0, 1, fy + 2, dtype=np.float32)[1:-1]
+                rx = np.linspace(0, 1, fx + 2, dtype=np.float32)[1:-1]
                 if y0 > 0:
-                    wy[:overlap] = np.linspace(0, 1, overlap, dtype=np.float32)
+                    wy[:fy] *= ry
                 if y1 < h:
-                    wy[-overlap:] = np.linspace(1, 0, overlap, dtype=np.float32)
+                    wy[-fy:] *= ry[::-1]
                 if x0 > 0:
-                    wx[:overlap] = np.linspace(0, 1, overlap, dtype=np.float32)
+                    wx[:fx] *= rx
                 if x1 < w:
-                    wx[-overlap:] = np.linspace(1, 0, overlap, dtype=np.float32)
+                    wx[-fx:] *= rx[::-1]
             wmask = wy[:, None] * wx[None, :]
 
             out[y0:y1, x0:x1] += res * wmask[..., None]

@@ -62,6 +62,9 @@ class PhotoScore:
     group_size: int = 1       # 近似/连拍组成员数（单张为 1）
     group_rank: int = 1       # 组内按综合分排序的名次（1 为最佳）
     group_best: bool = False  # 是否为该组当前最佳帧
+    original_width: int = 0
+    original_height: int = 0
+    file_size: int | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -191,7 +194,7 @@ def dhash(rgb: np.ndarray, size: int = 8) -> np.ndarray:
 
 
 def score_photo(img_work: np.ndarray, path: str | Path,
-                faces: bool = True, ai: bool = False) -> PhotoScore:
+                faces: bool = True, ai: bool = False, metadata: dict | None = None) -> PhotoScore:
     """对一张工作分辨率（≤WORK_SIZE）的 RGB 图打分。
 
     faces=False 跳过人脸检测（大图库快速扫描用，速度约 5 倍，
@@ -245,12 +248,12 @@ def score_photo(img_work: np.ndarray, path: str | Path,
                       contrast=round(con, 4), colorfulness=round(col, 4),
                       face_quality=round(fq, 4), score=round(float(score), 4),
                       faces=len(boxes), blinks=blinks, ai=(round(nima, 3) if nima else None),
-                      flags=flags)
+                      flags=flags, **(metadata or {}))
 
 
 def _group_bursts(photos: list[PhotoScore], hashes: dict[str, np.ndarray],
                   max_hamming: int = 8, aspect_tolerance: float = .18) -> None:
-    """按文件名顺序分组，同时匹配前帧与组首帧，避免相邻相似链无限漂移。
+    """同目录内用哈希分段索引匹配组首及组内前帧，不要求文件名相邻。
 
     dHash 不含尺寸或目录语义，故相同哈希也不能跨目录、横竖构图归组。
     不读取原片、EXIF 或磁盘状态；离线项目也能按已有扫描信息重新分组。
@@ -260,29 +263,42 @@ def _group_bursts(photos: list[PhotoScore], hashes: dict[str, np.ndarray],
         p.flags[:] = [flag for flag in p.flags if flag != F_DUP]
         p.group_size, p.group_rank, p.group_best = 1, 1, False
     gid = 0
-    prev_photo: PhotoScore | None = None
-    anchor: PhotoScore | None = None
+    bands = max_hamming + 1
+    directories = {}
+    anchors = {}
     for p in ordered:
         h = hashes.get(p.path)
+        directory = str(Path(p.path).parent)
         if h is None:
             p.group = -1
-            prev_photo = None
-            anchor = None
+            directories.pop(directory, None)  # Unknown frames remain a boundary.
             continue
-        if (prev_photo is not None
-                and anchor is not None
-                and Path(p.path).parent == Path(anchor.path).parent
-                and min(p.width, p.height, anchor.width, anchor.height) > 0
-                and max(p.width * anchor.height, anchor.width * p.height)
-                / min(p.width * anchor.height, anchor.width * p.height) - 1 <= aspect_tolerance
-                and np.count_nonzero(h != hashes[anchor.path]) <= max_hamming
-                and np.count_nonzero(h != hashes[prev_photo.path]) <= max_hamming):
-            p.group = prev_photo.group  # 加入上一张所在组
-        else:
-            p.group = gid               # 开启新组
+        value = int.from_bytes(np.packbits(h).tobytes(), 'little')
+        keys = [(i, (value >> (i * 64 // bands)) & ((1 << ((i+1)*64//bands-i*64//bands))-1))
+                for i in range(bands)]
+        buckets = directories.setdefault(directory, {})
+        candidates = set()
+        for key in keys:
+            candidates.update(buckets.get(key, ()))
+        matched = None
+        for candidate in sorted(candidates):
+            anchor, first, last = anchors[candidate]
+            if (min(p.width, p.height, anchor.width, anchor.height) > 0
+                    and max(p.width * anchor.height, anchor.width * p.height)
+                    / min(p.width * anchor.height, anchor.width * p.height)-1 <= aspect_tolerance
+                    and (value ^ first).bit_count() <= max_hamming
+                    and (value ^ last).bit_count() <= max_hamming):
+                matched = candidate
+                break
+        if matched is None:
+            matched = gid
+            anchors[gid] = (p, value, value)
+            for key in keys:
+                buckets.setdefault(key, set()).add(gid)
             gid += 1
-            anchor = p
-        prev_photo = p
+        anchor, first, _ = anchors[matched]
+        anchors[matched] = (anchor, first, value)
+        p.group = matched
 
     # 组内（≥2 张）只留最高分，其余标连拍重复
     by_group = defaultdict(list)
@@ -324,8 +340,9 @@ def smart_rank(photos: list[PhotoScore]) -> list[PhotoScore]:
 
 def _score_file(path: str, faces: bool = True, ai: bool = False):
     """加载单张并打分（模块级函数：worker 可直接调用）。"""
-    img = load_image(path, max_size=WORK_SIZE)
-    return score_photo(img, path, faces=faces, ai=ai), dhash(img)
+    metadata = {}
+    img = load_image(path, max_size=WORK_SIZE, metadata=metadata)
+    return score_photo(img, path, faces=faces, ai=ai, metadata=metadata), dhash(img)
 
 
 def _scan_sequential(paths: list[str], faces: bool = True, quiet: bool = True,

@@ -36,7 +36,7 @@ import urllib.parse
 import uuid
 from collections import OrderedDict
 from dataclasses import replace
-from concurrent.futures import as_completed, ThreadPoolExecutor
+from concurrent.futures import as_completed, ThreadPoolExecutor, Future
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -57,6 +57,7 @@ from .xmp import rating_for, read_rating, write_sidecar
 from .project import get_project_store, MAX_PROJECT_BYTES
 from .export_queue import ExportQueue
 from .export_recipe import freeze_session, thaw_session
+from .similarity_jobs import SimilarityJobs, MAX_REGROUP_BYTES
 
 PROCESS_LOCK = threading.Lock()   # FaceMesh 检测串行化，避免偶发竞态
 # HTTP threads are short-lived; their TLS FaceMesh would be recreated for every
@@ -66,6 +67,8 @@ _THUMB_LOCK = threading.Lock()     # 缩略图 LRU 由扫描线程与 HTTP 线�
 EXPORT_SIZE = 2048                # Web 预览导出尺寸（比 run 命令略小，求快）
 
 _thumb_cache: OrderedDict[tuple, bytes] = OrderedDict()
+_thumb_flights: dict[tuple, Future] = {}
+_PREVIEW_DECODE_LIMIT = threading.BoundedSemaphore(2)
 _CACHE_CAP = 600
 _SESSIONS: dict[str, dict] = {}   # sid → 处理会话（参考图 + 参数）
 _EXPORT_QUEUE = None
@@ -94,6 +97,7 @@ THUMB_KEEP = 40000  # 张数上限，超出删最旧的
 
 # 后台扫描任务：job_id → {total, done, photos, hashes, finished, cancelled, ...}
 SCAN_JOBS: dict[str, dict] = {}
+SIMILARITY_JOBS = SimilarityJobs(lambda path, size: _thumb(path, size))
 
 
 def _script_json(value: str) -> str:
@@ -169,18 +173,35 @@ def _thumb(path: str, size: int) -> bytes:
         if key in _thumb_cache:
             _thumb_cache.move_to_end(key)
             return _thumb_cache[key]
+        flight = _thumb_flights.get(key)
+        owner = flight is None
+        if owner:
+            flight = _thumb_flights[key] = Future()
+    if not owner:
+        return flight.result()
     try:
-        dp = _thumb_disk(path, size)
-        if dp.exists():
-            data = dp.read_bytes()
-            _remember_thumb(key, data)
-            return data
-    except OSError:
-        pass
-    img = load_image(path, max_size=size)
-    data = _thumb_bytes_from_img(img, path, size)
-    _remember_thumb(key, data)
-    return data
+        data = None
+        try:
+            dp = _thumb_disk(path, size)
+            if dp.exists():
+                data = dp.read_bytes()
+        except OSError:
+            pass
+        if data is None:
+            # Browsing never needs full RAW development; exports still use
+            # load_image's full-quality default. Bound concurrent native decodes.
+            with _PREVIEW_DECODE_LIMIT:
+                img = load_image(path, max_size=size, raw_preview=True)
+                data = _thumb_bytes_from_img(img, path, size)
+        _remember_thumb(key, data)
+        flight.set_result(data)
+        return data
+    except BaseException as exc:
+        flight.set_exception(exc)
+        raise
+    finally:
+        with _THUMB_LOCK:
+            _thumb_flights.pop(key, None)
 
 
 def _warm_engine():
@@ -309,9 +330,10 @@ def _scan_worker_impl(job_id: str):
         """极速段：只解码 + 基础指标 + 缩略图（无模型，秒级/张）。"""
         # RAW 优先使用相机写入的 JPEG 预览（毫秒级），避免批量 LibRaw
         # 显影把 78 张照片拖成分钟级；完整显影留给后续处理/精修。
-        img = load_image(path, max_size=WORK_SIZE, raw_preview=job["fast"])
+        metadata = {}
+        img = load_image(path, max_size=WORK_SIZE, raw_preview=job["fast"], metadata=metadata)
         ps = score_photo(img, path, faces=full_for_fast and job["faces"],
-                         ai=full_for_fast and job["ai"])
+                         ai=full_for_fast and job["ai"], metadata=metadata)
         h = dhash(img)
         try:
             _thumb_bytes_from_img(img, path, 360)
@@ -321,8 +343,9 @@ def _scan_worker_impl(job_id: str):
 
     def worker_full(path: str):
         """精扫段：基础分已算过的图补人脸 + AI。"""
-        img = load_image(path, max_size=WORK_SIZE)
-        return score_photo(img, path, faces=job["faces"], ai=job["ai"])
+        metadata = {}
+        img = load_image(path, max_size=WORK_SIZE, metadata=metadata)
+        return score_photo(img, path, faces=job["faces"], ai=job["ai"], metadata=metadata)
 
     use_pool = jobs_n > 1 and len(paths) >= 2
     ex = _get_fast_pool(jobs_n) if (use_pool and need_heavy) else \
@@ -715,20 +738,35 @@ def _decode_brush_mask(raw) -> np.ndarray:
     """
     if raw is None:
         raise ValueError("画笔掩码缺失")
-    if not isinstance(raw, str) or not raw or len(raw) > 8 * 1024 * 1024:
+    if not isinstance(raw, str) or not raw or len(raw) >= 8 * 1024 * 1024:
         raise ValueError("画笔掩码无效")
-    payload = raw.split(",", 1)[-1] if "," in raw else raw
+    if raw.startswith('data:') and not raw.startswith('data:image/png;base64,'):
+        raise ValueError("画笔掩码必须是 PNG")
+    payload = raw.split(",", 1)[-1] if raw.startswith('data:') else raw
     try:
-        data = base64.b64decode(payload, validate=False)
+        data = base64.b64decode(payload, validate=True)
     except (ValueError, binascii.Error):
         raise ValueError("画笔掩码编码无效")
+    if len(data) < 33 or data[:8] != b'\x89PNG\r\n\x1a\n' or data[12:16] != b'IHDR':
+        raise ValueError("画笔掩码必须是 PNG")
+    width, height = int.from_bytes(data[16:20], 'big'), int.from_bytes(data[20:24], 'big')
+    if not 0 < width <= 8192 or not 0 < height <= 8192 or width * height > 16_777_216:
+        raise ValueError("画笔掩码尺寸过大")
     try:
-        arr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE)
+        arr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
     except cv2.error:
         raise ValueError("画笔掩码解码失败")
-    if arr is None or arr.size == 0:
+    if arr is None or arr.size == 0 or arr.dtype not in (np.uint8, np.uint16):
         raise ValueError("画笔掩码解码失败")
-    return arr.astype(np.float32) / 255.0
+    maximum = float(np.iinfo(arr.dtype).max)
+    if arr.ndim == 2:
+        return arr.astype(np.float32) / maximum
+    if arr.ndim != 3 or arr.shape[2] not in (3, 4):
+        raise ValueError("画笔掩码通道无效")
+    gray = cv2.cvtColor(arr[..., :3], cv2.COLOR_BGR2GRAY).astype(np.float32) / maximum
+    if arr.shape[2] == 4:
+        gray *= arr[..., 3].astype(np.float32) / maximum
+    return gray
 
 
 def _process_one(payload: dict) -> dict:
@@ -1245,6 +1283,8 @@ class Handler(BaseHTTPRequestHandler):
                                          for name in PRESETS]})
             elif u.path == "/api/scan_status":
                 self._json(_scan_status(q))
+            elif u.path == '/api/regroup_status':
+                self._json(SIMILARITY_JOBS.status(q.get('job', [''])[0]))
             elif u.path == "/api/project":
                 self._json(get_project_store().load())
             elif u.path == "/api/exports":
@@ -1275,6 +1315,9 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/project" and n > MAX_PROJECT_BYTES:
                 self._json({"error": "project checkpoint exceeds size limit"}, 413)
                 return
+            if self.path == '/api/regroup' and n > MAX_REGROUP_BYTES:
+                self._json({'error': '相似识别请求过大，请缩小照片范围'}, 413)
+                return
             if self.path in {'/api/exports', '/api/export_action'} and n > MAX_EXPORT_REQUEST_BYTES:
                 self._json({'error': 'export request exceeds size limit'}, 413)
                 return
@@ -1290,6 +1333,11 @@ class Handler(BaseHTTPRequestHandler):
                 payload = json.loads(body or b"{}")
                 result = _scan_start(payload)
                 self._json(result)
+            elif self.path == '/api/regroup':
+                payload = json.loads(body or b'{}')
+                if not isinstance(payload, dict) or set(payload) - {'photos', 'similarity_profile'}:
+                    raise ValueError('相似识别请求结构无效')
+                self._json(SIMILARITY_JOBS.start(payload.get('photos'), payload.get('similarity_profile', 'balanced')))
             elif self.path == "/api/scan_cancel":
                 self._json(_scan_cancel(json.loads(body or b"{}")))
             elif self.path == "/api/import_paths":
@@ -1354,7 +1402,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 }}
 *{box-sizing:border-box}
 html,body{height:100%}
-body{margin:0;background:var(--bg);color:var(--fg);overflow:hidden;
+body{margin:0;display:flex;flex-direction:column;background:var(--bg);color:var(--fg);overflow:hidden;
   font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Helvetica Neue",sans-serif;
   -webkit-font-smoothing:antialiased}
 /* 动态壁纸光斑 */
@@ -1368,14 +1416,14 @@ body::after{background:radial-gradient(circle,#ffd4e0,#ffc9a3 55%,transparent 70
 
 /* ── 顶栏 ── */
 header{position:sticky;top:0;z-index:20;display:flex;gap:12px;align-items:center;
-  padding:12px 20px;background:var(--panel);backdrop-filter:saturate(180%) blur(24px);
+  flex:none;padding:10px 16px;background:var(--panel);backdrop-filter:saturate(180%) blur(24px);
   -webkit-backdrop-filter:saturate(180%) blur(24px);border-bottom:1px solid var(--line)}
 .brandMark{width:28px;height:28px;display:grid;place-items:center;flex:none;border-radius:8px;
   background:linear-gradient(145deg,#0a84ff,#5e5ce6);color:#fff;font-size:11px;font-weight:800;
   letter-spacing:-.04em;box-shadow:0 3px 10px rgba(10,132,255,.24)}
 header h1{font-size:17px;font-weight:700;letter-spacing:-.02em;margin:0 10px 0 0}
 header h1 span{color:var(--acc)}
-#folder{flex:1;max-width:540px;padding:8px 14px;border-radius:11px;border:1px solid var(--line);
+#folder{flex:1;min-width:100px;padding:8px 14px;border-radius:11px;border:1px solid var(--line);
   background:var(--panel-solid);color:var(--fg);outline:none;font-size:13px;
   transition:box-shadow .25s var(--ease),border-color .25s}
 #folder:focus{border-color:var(--acc2);box-shadow:0 0 0 4px rgba(0,113,227,.18)}
@@ -1392,12 +1440,12 @@ header h1 span{color:var(--acc)}
 .grow{flex:1}
 
 /* ── 主区 ── */
-main{display:flex;height:calc(100vh - 57px);position:relative;z-index:1}
-#center{flex:1;display:flex;flex-direction:column;min-width:0}
-#toolbar{display:flex;flex-direction:column;gap:9px;padding:12px 20px 10px;border-bottom:1px solid var(--line);
+main{display:flex;flex:1;min-height:0;position:relative;z-index:1}
+#center{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
+#toolbar{display:flex;flex-direction:column;flex:none;gap:4px;padding:4px 16px;border-bottom:1px solid var(--line);
   background:rgba(255,255,255,.16)}
 .toolbarRow{display:flex;align-items:center;gap:10px;min-width:0;flex-wrap:wrap}
-.toolbarRow.primary{min-height:34px}
+.toolbarRow.primary{min-height:34px;gap:8px}
 .toolbarRow.secondary{padding-top:1px}
 .batchRow{padding:8px 10px;border-top:1px solid var(--line);gap:8px}
 .batchRow .toolSelect{display:flex;align-items:center;gap:6px;color:var(--dim);font-size:12px;white-space:nowrap}
@@ -1408,16 +1456,34 @@ main{display:flex;height:calc(100vh - 57px);position:relative;z-index:1}
 .btn.trashAction:hover{background:rgba(180,35,24,.08);box-shadow:none}
 @media(prefers-color-scheme:dark){.btn.trashAction{color:#ff8a80;border-color:rgba(255,138,128,.3)}}
 .projectRow{font-size:12px;color:var(--dim);gap:8px}
-#projectStatus{--project-warning:#8a4a00;flex:1 1 260px;min-width:0;max-height:96px;overflow:auto;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere}
+#projectStatus{--project-warning:#8a4a00;flex:1 1 100px;min-width:0;max-height:32px;overflow:auto;line-height:1.35;white-space:pre-wrap;overflow-wrap:anywhere}
 #projectStatus[data-state="error"],#projectStatus[data-state="blocked"]{color:var(--project-warning)}
 @media(prefers-color-scheme:dark){#projectStatus{--project-warning:#ffc36b}}
-#toolbar .tip{display:flex;align-items:center;gap:9px;flex:1 1 260px;min-width:220px;color:var(--dim);font-size:12px;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .toolbarKicker{color:var(--fg);font-weight:700;font-size:12px}
 .toolGroup{display:flex;align-items:center;gap:8px;min-width:0;padding-left:12px;border-left:1px solid var(--line)}
 .toolGroupLabel{color:var(--dim);font-size:11px;font-weight:700;letter-spacing:.04em;white-space:nowrap}
 #toolbar .toolSelect{display:flex;align-items:center;gap:5px;color:var(--dim);font-size:11px;white-space:nowrap;flex:none}
 #toolbar .toolSelect select{width:auto;min-width:78px;padding:6px 8px;font-size:12px;border-radius:8px}
+.sizeFilters{padding:10px 0;border-top:1px solid var(--line);margin-top:10px}
+#reviewBar{display:flex;align-items:center;flex-wrap:wrap;gap:4px 12px;min-width:0}
+#reviewTools{font-size:12px;flex:none;max-height:45vh;overflow:auto}
+#reviewTools[open]{flex:1 1 100%}
+#reviewTools>summary{cursor:pointer;padding:5px 0;color:var(--fg);font-weight:600;white-space:nowrap}
+#reviewTools[open]>.secondary{padding:8px 0}
+.projectRow{flex:1 1 240px;min-width:0;margin-left:auto;padding:0;justify-content:flex-end;flex-wrap:nowrap}
+.projectRow .btn{font-size:12px;padding:5px 10px}
+#regroupStatus{font-size:12px;color:var(--fg);font-variant-numeric:tabular-nums}
+#side[hidden]{display:none}
+.card:focus-visible{outline:2px solid var(--acc);outline-offset:3px}
+.sizeFilters summary{cursor:pointer;font-size:13px;font-weight:600;padding:4px 0}
+.sizeFilterFields{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-top:10px}
+.sizeFilterFields fieldset{border:0;padding:0;margin:0;display:flex;align-items:center;gap:6px;min-width:0}
+.sizeFilterFields legend{float:left;margin-right:8px;font-size:12px}
+.sizeFilterFields input{width:90px;max-width:22vw;padding:7px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel-solid);color:var(--fg)}
+.sizeFilterFields input:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+#sizeFilterStatus{font-size:12px;line-height:1.6;margin:8px 0 0;color:var(--fg)}
+#filterEmpty{padding:28px 20px;text-align:center;line-height:1.7}
+#filterEmpty[hidden]{display:none}
 #toolbar .toolbarActions{display:flex;align-items:center;gap:8px;margin-left:auto;flex:none}
 #toolbar .toolbarActions .btn{padding-left:12px;padding-right:12px}
 #viewbar{display:flex;align-items:center;gap:2px;padding:2px;border:1px solid var(--line);
@@ -1426,7 +1492,7 @@ main{display:flex;height:calc(100vh - 57px);position:relative;z-index:1}
   padding:5px 9px;font-size:12px;font-weight:650;line-height:1;transition:background .2s,color .2s,box-shadow .2s}
 #viewbar button:hover{color:var(--fg)}
 #viewbar button.on{background:var(--panel-solid);color:var(--fg);box-shadow:0 1px 4px rgba(0,0,0,.14)}
-#scanInfo{white-space:nowrap;font-variant-numeric:tabular-nums}
+#scanInfo{white-space:nowrap;font-variant-numeric:tabular-nums;max-width:36vw;overflow:hidden;text-overflow:ellipsis;font-size:12px}
 .chk.slim{margin:0;white-space:nowrap;flex:none}
 .chk.slim .sw{width:36px;height:21px;border-radius:11px}
 .chk.slim .sw::after{width:17px;height:17px}
@@ -1437,15 +1503,15 @@ main{display:flex;height:calc(100vh - 57px);position:relative;z-index:1}
 #scanfill{display:block;height:100%;width:0;border-radius:2px;
   background:linear-gradient(90deg,var(--acc2),var(--acc));transition:opacity .2s var(--ease)}
 #scantext{color:var(--dim);font-size:12px;white-space:nowrap;font-variant-numeric:tabular-nums}
-#grid{--tile-min:230px;--thumb-min:160px;flex:1;overflow-y:auto;padding:14px 20px 28px;
+#grid{--tile-min:250px;--thumb-min:190px;flex:1;min-height:0;overflow-y:auto;padding:12px 16px 24px;
   display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--tile-min),1fr));
-  grid-auto-rows:minmax(calc(var(--thumb-min) + 124px),auto);gap:18px;align-content:start;align-items:start}
+  grid-auto-rows:minmax(calc(var(--thumb-min) + 96px),auto);gap:16px;align-content:start;align-items:start}
 #grid[data-density="compact"]{--tile-min:190px;--thumb-min:140px;gap:14px}
 #grid[data-density="large"]{--tile-min:300px;--thumb-min:208px;gap:20px}
 #grid[data-layout="groups"]{display:block}
 .photoGroup{margin:0 0 32px;min-width:0;border-top:1px solid var(--track)}
-.groupHeader{display:flex;align-items:center;flex-wrap:wrap;gap:8px 16px;padding:12px 0;
-  position:sticky;top:0;z-index:5;background:var(--bg)}
+.groupHeader{display:flex;align-items:center;flex-wrap:wrap;gap:8px 16px;padding:8px 0;
+  position:static;background:var(--bg)}
 .groupHeading{display:flex;align-items:baseline;flex-wrap:wrap;gap:8px 12px;flex:1;min-width:0}
 .groupHeading h3{font-size:14px;margin:0;font-weight:700}
 .groupSummary{font-size:12px;color:var(--fg);font-variant-numeric:tabular-nums}
@@ -1460,14 +1526,15 @@ main{display:flex;height:calc(100vh - 57px);position:relative;z-index:1}
   color:var(--fg);background:var(--panel-solid);font-size:11px;font-weight:650;pointer-events:none}
 #grid[data-layout="groups"] .compareBtn{display:none}
 .groupActions .btn:focus-visible{outline:2px solid var(--acc);outline-offset:3px}
-#groupNav{padding:8px 20px;border-bottom:1px solid var(--line);gap:8px;background:var(--bg);flex:none}
+#groupNav{padding:0;gap:6px;flex:1 1 auto}
 #groupNav[hidden]{display:none}
-#groupPosition{font-size:12px;min-width:130px;color:var(--fg);font-variant-numeric:tabular-nums}
-#groupNav .btn{font-size:12px;padding:6px 10px}
-.groupNavHint{font-size:11px;color:var(--dim);margin-left:auto}
+#groupPosition{font-size:12px;min-width:110px;color:var(--fg);font-variant-numeric:tabular-nums}
+#groupNav .btn{font-size:12px;padding:4px 8px}
+.reviewKeyHint{font-size:11px;color:var(--dim);margin-left:auto;white-space:nowrap}
+@media(max-width:1200px){.reviewKeyHint{display:none}}
 .card{position:relative;background:var(--panel-solid);border-radius:12px;overflow:hidden;cursor:pointer;
   border:2.5px solid transparent;box-shadow:var(--shadow);
-  display:block;width:100%;height:auto;min-width:0;min-height:calc(var(--thumb-min) + 124px);
+  display:block;width:100%;height:auto;min-width:0;min-height:calc(var(--thumb-min) + 96px);
   transition:transform .3s var(--ease),box-shadow .3s,border-color .25s;
   animation:cardIn .6s var(--ease) both}
 @keyframes cardIn{from{opacity:0;transform:translateY(18px) scale(.96)}to{opacity:1;transform:none}}
@@ -1499,7 +1566,7 @@ main{display:flex;height:calc(100vh - 57px);position:relative;z-index:1}
 .targetBtn:hover{background:var(--acc);border-color:var(--acc)}
 .targetBtn.on{background:#ffd60a;border-color:#ffd60a;color:#3b2b00}
 .card.target{box-shadow:0 0 0 3px rgba(255,214,10,.38),var(--shadow-lg)}
-.meta{padding:10px 12px 12px;display:flex;flex-direction:column;gap:8px;min-height:124px}
+.meta{padding:8px 10px;display:flex;flex-direction:column;gap:6px;min-height:96px}
 .cardIdentity{display:flex;align-items:center;gap:8px;min-width:0;width:100%}
 .cardIdentity .name{flex:1;min-width:0}
 .ratingSummary{flex:none;color:#805200;font-size:11px;font-weight:650;white-space:nowrap}
@@ -1764,7 +1831,8 @@ input[type=range]::-webkit-slider-thumb:active{cursor:grabbing;transform:scale(1
 .comparePane .compareStar{border:0;background:rgba(0,0,0,.5);border-radius:99px;color:#fff;padding:3px 7px;cursor:pointer}
 .comparePane .compareStar.on{color:#ffd60a}
 @media(max-width:900px){#compareGrid{grid-template-columns:repeat(2,minmax(0,1fr));overflow-y:auto}.comparePane{min-height:220px}}
-@media(max-width:560px){#toolbar .toolSelect{display:none}#compareGrid{grid-template-columns:1fr}.comparePane{min-height:260px}}
+@media(max-width:900px){#side{position:absolute;right:0;top:0;bottom:0;z-index:25;max-width:calc(100% - 24px)}header{gap:6px;padding:8px}header h1{margin-right:0}#scanInfo{max-width:20vw}}
+@media(max-width:560px){header{flex-wrap:wrap}#folder{order:2;flex-basis:100%}#toolbar .toolGroup{flex-wrap:wrap}#compareGrid{grid-template-columns:1fr}.comparePane{min-height:260px}}
 
 /* ── toast ── */
 #toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,80px);z-index:60;
@@ -1791,7 +1859,6 @@ input[type=range]::-webkit-slider-thumb:active{cursor:grabbing;transform:scale(1
 <div id="center">
   <div id="toolbar">
     <div class="toolbarRow primary">
-      <span class="tip" id="tip"><span class="toolbarKicker">审片</span>点击选择 · 双击进入快审 · ⌘A 全选</span>
       <div class="toolGroup" aria-label="排列和筛选">
         <span class="toolGroupLabel">排列</span>
         <label class="toolSelect"><span>排序</span><select id="sortMode" aria-label="排序方式">
@@ -1810,7 +1877,27 @@ input[type=range]::-webkit-slider-thumb:active{cursor:grabbing;transform:scale(1
         <button type="button" data-density="comfortable" class="on" title="平衡浏览与细节">中</button>
         <button type="button" data-density="large" title="放大缩略图">大</button>
       </div>
+      <button class="btn ghost" id="regroupButton" type="button" onclick="regroupVisiblePhotos()" title="利用已有预览重建相似组，不重新评分、不改变选择和星级">识别相似</button>
+      <button class="btn ghost" id="sideToggle" type="button" aria-controls="side" aria-expanded="false" onclick="setSidebarOpen($('side').hidden,true)">处理参数</button>
+      <span class="reviewKeyHint">空格 开关快览 · 1–5 加星</span>
     </div>
+    <div id="reviewBar">
+    <details id="reviewTools"><summary title="大小过滤 / 扫描选项 / 加星与删除">筛选与批量操作</summary>
+    <details class="sizeFilters" id="sizeFilters">
+      <summary>照片大小过滤 · 排除图标和小图</summary>
+      <div class="sizeFilterFields">
+        <fieldset><legend>原图短边（px）</legend>
+          <input id="sizeMinEdge" type="number" value="" min="0" max="200000" step="1" placeholder="不限" aria-label="原图短边下限，像素">
+          <span>至</span><input id="sizeMaxEdge" type="number" value="" min="0" max="200000" step="1" placeholder="不限" aria-label="原图短边上限，像素"></fieldset>
+        <fieldset><legend>文件大小（MB）</legend>
+          <input id="sizeMinMB" type="number" value="" min="0" step="0.01" placeholder="不限" aria-label="文件大小下限，MB">
+          <span>至</span><input id="sizeMaxMB" type="number" value="" min="0" step="0.01" placeholder="不限" aria-label="文件大小上限，MB"></fieldset>
+        <button type="button" class="btn ghost" onclick="applySizeFilter()">应用范围</button>
+        <button type="button" class="btn ghost" onclick="excludeSmallImages()">排除小图（短边 ≥600 px）</button>
+        <button type="button" class="btn ghost" onclick="resetSizeFilter()">清除大小条件</button>
+      </div>
+      <p id="sizeFilterStatus" role="status" aria-live="polite">留空表示不限；范围包含边界。只过滤显示，不删除文件。</p>
+    </details>
     <div class="toolbarRow secondary">
       <div class="toolGroup" aria-label="分析选项">
         <span class="toolGroupLabel">分析</span>
@@ -1842,28 +1929,34 @@ input[type=range]::-webkit-slider-thumb:active{cursor:grabbing;transform:scale(1
       <button class="btn trashAction" id="trashBtn" type="button" disabled onclick="deleteSelectedToTrash()">移到废纸篓/回收站</button>
       <span class="batchHint">删除原片可从系统废纸篓/回收站恢复</span>
     </div>
-  </div>
-  <div class="toolbarRow projectRow" style="padding:8px 20px">
-    <span id="projectStatus" role="status" aria-live="polite">正在恢复项目…</span>
-    <button class="btn ghost" id="projectSave" type="button" onclick="saveProject(true)">保存项目</button>
-    <button class="btn ghost" id="projectRetry" type="button" hidden onclick="restoreProject()">重试恢复</button>
-  </div>
-  <div id="scanbar"><div id="scantrack"><i id="scanfill"></i></div>
-    <span id="scantext"></span>
-    <button class="btn ghost" id="cancelscan" onclick="cancelScan()" style="display:none">取消</button></div>
+    </details>
   <div class="toolbarRow" id="groupNav" hidden aria-label="相似组导航">
     <span id="groupPosition" role="status" aria-live="polite"></span>
     <button class="btn ghost" id="previousGroup" type="button" onclick="navigateGroup(-1)">上一组</button>
     <button class="btn ghost" id="nextGroup" type="button" onclick="navigateGroup(1)">下一组</button>
     <button class="btn ghost" type="button" onclick="setAllGroupsCollapsed(true)">全部收起</button>
     <button class="btn ghost" type="button" onclick="setAllGroupsCollapsed(false)">全部展开</button>
-    <span class="groupNavHint">选中照片后按 1–5 加星 · 0 清除</span>
   </div>
+  <div class="toolbarRow projectRow">
+    <span id="projectStatus" role="status" aria-live="polite">正在恢复项目…</span>
+    <span id="regroupStatus" role="status" aria-live="polite"></span>
+    <button class="btn ghost" id="projectSave" type="button" onclick="saveProject(true)">保存项目</button>
+    <button class="btn ghost" id="projectRetry" type="button" hidden onclick="restoreProject()">重试恢复</button>
+  </div>
+  </div>
+  </div>
+  <div id="scanbar"><div id="scantrack"><i id="scanfill"></i></div>
+    <span id="scantext"></span>
+    <button class="btn ghost" id="cancelscan" onclick="cancelScan()" style="display:none">取消</button></div>
   <div id="grid" data-density="comfortable"></div>
+  <div id="filterEmpty" hidden role="status">没有符合当前筛选条件的照片。照片仍保留在项目中。<br>
+    <span id="groupEmptyHint"></span>
+    <button type="button" class="btn ghost" onclick="regroupVisiblePhotos()">重新识别相似照片</button>
+    <button type="button" class="btn ghost" onclick="clearPhotoFilters()">清除筛选，显示全部</button></div>
   <div id="empty"><div class="orb"></div><h2>把照片拖进来，或选择文件夹</h2>
     <p>支持拖入整个文件夹（含子文件夹）· JPEG / PNG / RAW · 也可直接输入路径</p></div>
 </div>
-<div id="side"><h2>处理参数</h2>
+<div id="side" hidden><h2>处理参数</h2>
   <div class="sect">白平衡</div>
   <div class="seg" id="wbSeg">
     <div class="thumb"></div>
@@ -1965,7 +2058,7 @@ input[type=range]::-webkit-slider-thumb:active{cursor:grabbing;transform:scale(1
     <div id="lbExif"></div>
     <div style="color:var(--dim);font-size:11.5px">
       <span class="lbKey">←</span><span class="lbKey">→</span>切换
-      <span class="lbKey">空格</span>保留/移出
+      <span class="lbKey">空格</span>返回选片
       <span class="lbKey">0</span>–<span class="lbKey">5</span>星级（写 XMP）
       <span class="lbKey">Esc</span>关闭</div>
   </div>
@@ -2002,6 +2095,10 @@ const CULL_HISTORY={undo:[],redo:[],applying:false};
 // 每次启动扫描/导入都递增；旧请求返回后不得覆盖新任务。
 let SCAN_REQ_GEN=0;
 const $=id=>document.getElementById(id);
+function baseName(path){
+  const parts=String(path??'').replace(/\\/g,'/').split('/').filter(Boolean);
+  return parts.length?parts[parts.length-1]:'';
+}
 async function api(path,body){
   const r=await fetch(path,body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:undefined);
   let j;try{j=await r.json();}catch(error){error.status=r.status;error.responseReceived=true;throw error;}
@@ -2114,8 +2211,8 @@ async function openExportResults(id,offset=0){
     for(const item of (response.job.items||[]).slice(0,50)){
       const pair=document.createElement('div');pair.className='pair';const result=item.result;
       if(result){const before=exportMediaURL(result.before,'preview'),after=exportMediaURL(result.after,'preview'),download=exportMediaURL(result.download,'download');
-        pair.innerHTML=`<div class="cmp"><img alt="原始照片" loading="lazy" src="${escapeHtml(before)}"><img alt="导出效果" loading="lazy" class="b" src="${escapeHtml(after)}"><div class="bar"></div><div class="knob">◄►</div><span class="tag l">原始</span><span class="tag r">成品</span></div><div class="name">${escapeHtml(item.path.split('/').pop())}</div>${download?`<a href="${escapeHtml(download)}" download="${escapeHtml(result.out.split('/').pop())}">下载完整成品</a>`:''}`;bindCmp(pair.querySelector('.cmp'));
-      }else pair.textContent=item.path.split('/').pop()+' · '+(item.error||item.state);
+        pair.innerHTML=`<div class="cmp"><img alt="原始照片" loading="lazy" src="${escapeHtml(before)}"><img alt="导出效果" loading="lazy" class="b" src="${escapeHtml(after)}"><div class="bar"></div><div class="knob">◄►</div><span class="tag l">原始</span><span class="tag r">成品</span></div><div class="name">${escapeHtml(baseName(item.path))}</div>${download?`<a href="${escapeHtml(download)}" download="${escapeHtml(baseName(result.out))}">下载完整成品</a>`:''}`;bindCmp(pair.querySelector('.cmp'));
+      }else pair.textContent=baseName(item.path)+' · '+(item.error||item.state);
       inner.appendChild(pair);
     }$('results').classList.add('show');
   }catch(error){if(generation===EXPORT_QUEUE.reviewGeneration)queueMessage('结果暂时无法打开：'+error.message);}
@@ -2142,7 +2239,7 @@ function projectSnapshot(){
       rating:pendingRatingPrevious.has(p.path)?pendingRatingPrevious.get(p.path):(p.rating||0)})),
     selected:[...selectedPaths].filter(path=>libraryByPath.has(path)||library.some(p=>p.path===path)),
     target:targetPath,selection_touched:selectionTouched,scan_incomplete:PROJECT.scanIncomplete,
-    settings:{recipe:recipeValues(),sortMode,filterMode,density:$('grid').dataset.density,similarityProfile:$('similarityProfile').value||'balanced',
+    settings:{recipe:recipeValues(),sortMode,filterMode,sizeFilter:{...sizeFilter},sidebarOpen:!$('side').hidden,density:$('grid').dataset.density,similarityProfile:$('similarityProfile').value||'balanced',
       options:Object.fromEntries(['facesOpt','aiOpt','recursiveOpt','preserveLuma','skinProtect'].map(id=>[id,$(id).checked])),
       algo:$('algo').value,exportSize:$('exportSize').value,exportQuality:$('exportQuality').value},
     drafts:Object.fromEntries(EDIT_DRAFTS)};
@@ -2181,6 +2278,8 @@ async function saveProject(explicit=false){
 function validateProjectSettings(settings){
   if(!settings||typeof settings!=='object'||Array.isArray(settings))throw new Error('项目设置无效');
   validateRecipe(settings.recipe);
+  if(settings.sizeFilter!==undefined)validateSizeFilter(settings.sizeFilter);
+  if(settings.sidebarOpen!==undefined&&typeof settings.sidebarOpen!=='boolean')throw new Error('项目参数面板设置无效');
   if(settings.similarityProfile!==undefined&&!['strict','balanced','loose'].includes(settings.similarityProfile))throw new Error('项目相似分组设置不合法');
   const enums={sortMode:['smart','score','name','rating'],filterMode:['all','recommended','groups','starred','review'],
     density:['compact','comfortable','large'],algo:[...$('algo').options].map(o=>o.value),
@@ -2220,6 +2319,8 @@ async function restoreProject(){
     for(const id of ['facesOpt','aiOpt','recursiveOpt','preserveLuma','skinProtect'])$(id).checked=state.settings.options[id];
     for(const id of ['algo','exportSize','exportQuality'])$(id).value=state.settings[id];
     sortMode=state.settings.sortMode;filterMode=state.settings.filterMode;
+    sizeFilter=validateSizeFilter(state.settings.sizeFilter||emptySizeFilter());syncSizeFilterInputs();
+    setSidebarOpen(state.settings.sidebarOpen===true);
     $('sortMode').value=sortMode;$('filterMode').value=filterMode;setDensity(state.settings.density,false);
     replaceProjectLibrary(usable);selectedPaths=new Set(state.selected.filter(path=>libraryByPath.has(path)));
     selectionTouched=state.selection_touched;targetPath=libraryByPath.has(state.target)?state.target:null;
@@ -2335,6 +2436,57 @@ function toast(msg){const t=$('toast');t.textContent=msg;t.classList.add('show')
   clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),2600);}
 const SORT_KEY='photopilot-sort-v1', FILTER_KEY='photopilot-filter-v1';
 let sortMode='smart', filterMode='all';
+let activePhotoPath=null;
+function setSidebarOpen(open,remember=false){
+  $('side').hidden=!open;$('sideToggle').setAttribute('aria-expanded',String(!!open));
+  if(remember){projectChanged();if(!open)$('sideToggle').focus?.({preventScroll:true});}
+  queueGroupFill();
+}
+function emptySizeFilter(){return {minEdge:null,maxEdge:null,minMB:null,maxMB:null};}
+let sizeFilter=emptySizeFilter();
+function validateSizeFilter(value){
+  const limits={minEdge:200000,maxEdge:200000,minMB:8589934591,maxMB:8589934591};
+  if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).length!==4)throw new Error('大小范围设置无效');
+  for(const [key,limit] of Object.entries(limits)){
+    const n=value[key];
+    if(n!==null&&(typeof n!=='number'||!Number.isFinite(n)||n<0||n>limit||key.endsWith('Edge')&&!Number.isInteger(n)))throw new Error('大小范围必须为有效非负数，像素需为整数');
+  }
+  if(value.minEdge!==null&&value.maxEdge!==null&&value.minEdge>value.maxEdge||value.minMB!==null&&value.maxMB!==null&&value.minMB>value.maxMB)throw new Error('范围下限不能大于上限');
+  return {...value};
+}
+function sizeFilterActive(){return Object.values(sizeFilter).some(v=>v!==null);}
+function matchesSizeFilter(photo){
+  const f=sizeFilter;
+  if(f.minEdge!==null||f.maxEdge!==null){
+    const edge=Math.min(photo.original_width||0,photo.original_height||0);
+    if(!(edge>0)||f.minEdge!==null&&edge<f.minEdge||f.maxEdge!==null&&edge>f.maxEdge)return false;
+  }
+  if(f.minMB!==null||f.maxMB!==null){
+    const bytes=photo.file_size;
+    if(typeof bytes!=='number'||!Number.isFinite(bytes)||bytes<0||f.minMB!==null&&bytes<f.minMB*1048576||f.maxMB!==null&&bytes>f.maxMB*1048576)return false;
+  }
+  return true;
+}
+function syncSizeFilterInputs(){
+  for(const [key,id] of Object.entries({minEdge:'sizeMinEdge',maxEdge:'sizeMaxEdge',minMB:'sizeMinMB',maxMB:'sizeMaxMB'}))$(id).value=sizeFilter[key]===null?'':String(sizeFilter[key]);
+}
+function applySizeFilter(){
+  try{
+    const value={};
+    for(const [key,id] of Object.entries({minEdge:'sizeMinEdge',maxEdge:'sizeMaxEdge',minMB:'sizeMinMB',maxMB:'sizeMaxMB'})){
+      const text=$(id).value.trim();value[key]=text===''?null:Number(text);
+      if($(id).validity?.badInput)throw new Error('请填写有效的大小范围');
+    }
+    sizeFilter=validateSizeFilter(value);
+  }catch(error){$('sizeFilterStatus').textContent=error.message+'；原筛选条件保持不变。';return false;}
+  projectChanged();rebuildView();return true;
+}
+function resetSizeFilter(){sizeFilter=emptySizeFilter();syncSizeFilterInputs();projectChanged();rebuildView();}
+function excludeSmallImages(){
+  sizeFilter={minEdge:600,maxEdge:null,minMB:null,maxMB:null};
+  filterMode='all';$('filterMode').value='all';syncSizeFilterInputs();rememberView();rebuildView();
+}
+function clearPhotoFilters(){filterMode='all';$('filterMode').value='all';resetSizeFilter();rememberView();}
 function isGroup(p){return Number(p.group_size||1)>=2;}
 function groupOrder(items){
   const best=new Map();
@@ -2356,6 +2508,7 @@ function sortPhotos(items){
   });
 }
 function filterPhotos(items){
+  items=items.filter(matchesSizeFilter);
   if(filterMode==='recommended')return items.filter(autoSel);
   if(filterMode==='groups')return items.filter(isGroup);
   if(filterMode==='starred')return items.filter(p=>(p.rating||0)>0);
@@ -2617,6 +2770,13 @@ function updateStats(){
   updateGroupSummaries();
   syncBatchControls();
   const total=library.length;
+  $('filterEmpty').hidden=!total||ranked.length>0;
+  $('groupEmptyHint').textContent=filterMode==='groups'&&!library.some(isGroup)?
+    (PROJECT.scanIncomplete?'上次扫描中断，分组尚未完成；可直接重建分组，不必重新评分。':'当前尚无相似分组，可使用“识别相似”重新检测。'):'';
+  const unknown=library.filter(p=>(sizeFilter.minEdge!==null||sizeFilter.maxEdge!==null)&&!(p.original_width>0&&p.original_height>0)||
+    (sizeFilter.minMB!==null||sizeFilter.maxMB!==null)&&typeof p.file_size!=='number').length;
+  $('sizeFilterStatus').textContent=(sizeFilterActive()?`大小条件匹配 ${library.filter(matchesSizeFilter).length} / ${total} 张。范围外照片不会参与批量加星、移除或删除。`:'大小不限；只过滤显示，不删除文件。')+
+    (unknown?` ${unknown} 张缺少原图尺寸或文件大小，当前暂不显示；重新扫描可补齐。`:'')+' 与上方照片筛选同时生效；1 MB = 1024 KB。';
   if(!total){$('scanInfo').textContent='';return;}
   const visible=ranked.length;
   const selection=selectionCounts();
@@ -2624,13 +2784,13 @@ function updateStats(){
   $('scanInfo').textContent=`共 ${total} 张 · 当前显示 ${visible} · 当前可见已选 ${selection.visible} · 全部已选 ${selection.total}`;
   $('scanInfo').title=`共 ${total} 张 · 推荐 ${recommended} 张 · 隐藏已选 ${selection.hidden} 张`;
   // 窗口标题随项目更新（WKWebView/多窗口/Spotlight 切换时有用）
-  const folder=(PROJECT.folder||'').split('/').filter(Boolean).pop()||'PhotoPilot';
+  const folder=baseName(PROJECT.folder)||'PhotoPilot';
   document.title=`${folder} · ${total} 张 — PhotoPilot`;
 }
 function updateTargetUI(){
   const info=$('targetInfo'),clear=$('clearTarget');
   if(targetPath){
-    info.textContent='目标：'+targetPath.split('/').pop();
+    info.textContent='目标：'+baseName(targetPath);
     info.classList.add('on');clear.disabled=false;
   }else{
     info.textContent='请选择一张目标照片：点击卡片上的「设为目标」';
@@ -2646,7 +2806,7 @@ function updateTargetUI(){
 function setTarget(path){
   if(!path)return;
   targetPath=path;updateTargetUI();projectChanged();
-  toast('已设为追色目标：'+path.split('/').pop());
+  toast('已设为追色目标：'+baseName(path));
 }
 function clearTarget(){
   targetPath=null;updateTargetUI();projectChanged();toast('已清除追色目标');
@@ -2746,9 +2906,11 @@ function cardFor(p,idx=0,animate=false){
 
 function makeCard(p,idx,animate=true){
   const ringC=scoreRingColor(p), flags=flagsHtml(p);
-  const photoName=escapeHtml(p.path.split('/').pop()),thumbUrl=escapeHtml(p.thumb);
+  const photoName=escapeHtml(baseName(p.path)),thumbUrl=escapeHtml(p.thumb);
   const d=document.createElement('div');
   d.className='card'+(selectedPaths.has(p.path)?' sel':'');d.dataset.path=p.path;
+  d.tabIndex=0;d.setAttribute('aria-label',baseName(p.path)+'，按空格快览');
+  d.onfocus=()=>{activePhotoPath=p.path;};
   if(animate)d.style.animationDelay=Math.min((idx%24)*25,400)+'ms';
   else d.style.animation='none';
   const group=p.group_size>=2?`<span class="pill groupBadge">相似 ${p.group_rank}/${p.group_size}</span>`:'';
@@ -2772,7 +2934,7 @@ function makeCard(p,idx,animate=true){
       <div class="cardQuality"><div class="ring" style="--ring-c:${ringC};--p:0" data-p="${p.score*100}"><b>${p.score.toFixed(2).slice(1)}</b></div><div class="flags">${flags}</div></div>
       <div class="badges">${group}${p.faces?`<span class="pill face">${p.faces} 脸${p.blinks?' · '+p.blinks+' 闭眼':''}</span>`:''}${p.ai!=null?`<span class="pill ai">AI ${p.ai.toFixed(1)}</span>`:''}</div>${compare}
     </div>`;
-  d.onclick=()=>{if(CULL_HISTORY.applying)return;const before=new Set(selectedPaths);selectionTouched=true;d.classList.toggle('sel');
+  d.onclick=()=>{if(CULL_HISTORY.applying)return;activePhotoPath=p.path;d.focus?.({preventScroll:true});const before=new Set(selectedPaths);selectionTouched=true;d.classList.toggle('sel');
     if(d.classList.contains('sel'))selectedPaths.add(p.path);else selectedPaths.delete(p.path);
     recordSelection(before,'选择照片');
     updateStats();projectChanged();};
@@ -3379,14 +3541,14 @@ async function process(operation,retryPaths=null){
           ${single&&operation!=='color'?'<canvas id="editBrushCanvas" class="brush-canvas" hidden></canvas>':''}
           <div class="bar"></div><div class="knob">◄►</div>
           <span class="tag l">原始</span><span class="tag r">成品</span></div>
-          <div class="name" style="padding:8px 4px 0">${escapeHtml(p.split('/').pop())}</div>`;
+          <div class="name" style="padding:8px 4px 0">${escapeHtml(baseName(p))}</div>`;
         bindCmp(pair.querySelector('.cmp'));
         if(single){
           $('editStage').appendChild(pair);
           CURRENT_EDITOR={sid:prep.sid,path:p,revision:0,renderEpoch:0,busy:false,previewPending:false,exporting:false,operation,
             settings,baseSignature:signature,tone:{...initialTone},history:draft?.history||[{...initialTone}],
             initialRetouch:{...openingRetouch},retouch:{...initialRetouch},retouchHistory:draft?.retouchHistory||[{...initialRetouch}],
-            index:draft?.index||0,gesture:null,showMask:false,maskFrame:null,brushMask:null};
+            index:draft?.index||0,gesture:null,showMask:false,maskFrame:null,brushMask:initialRetouch.brush_mask??null};
           if(operation!=='color'){
             buildToneControls($('editToneControls'),'edit-',initialTone,queueEditorPreview);
             buildRetouchControls(CURRENT_EDITOR);hideEditorMask(CURRENT_EDITOR);
@@ -3396,7 +3558,7 @@ async function process(operation,retryPaths=null){
           updateEditorHistory();
           showEditorWarnings(r);
         }else inner.appendChild(pair);
-      }catch(e){if(generation!==PROCESS_GEN)return;done++;lastFailedPaths.push(p);console.warn(e);toast(p.split('/').pop()+'：'+e.message);}
+      }catch(e){if(generation!==PROCESS_GEN)return;done++;lastFailedPaths.push(p);console.warn(e);toast(baseName(p)+'：'+e.message);}
     }
     $('pnum').textContent=`${done} / ${prep.count}`;
     $('pfill').style.width='100%';
@@ -3421,6 +3583,7 @@ function brushCanvas(){return $('editBrushCanvas');}
 function brushModeEl(){return $('editBrushPaint');}
 function brushEraseEl(){return $('editBrushErase');}
 function setBrushMode(mode){
+  if(CURRENT_EDITOR?.exporting)return;
   BRUSH_MODE=mode;
   brushModeEl().classList.toggle('on',mode==='paint');
   brushEraseEl().classList.toggle('on',mode==='erase');
@@ -3437,6 +3600,7 @@ function syncBrushUI(){
 }
 function setupBrushCanvas(){
   const canvas=brushCanvas();if(!canvas)return;
+  if(canvas._brushDrawing)return;
   const cmp=canvas.closest('.cmp');if(!cmp)return;
   const img=cmp.querySelector('img.b');
   // canvas 覆盖在预览图上，尺寸对齐 object-fit:contain 后的实际图片区域，
@@ -3453,15 +3617,18 @@ function setupBrushCanvas(){
   canvas.style.width=dw+'px';canvas.style.height=dh+'px';
   canvas.width=Math.round(dw);canvas.height=Math.round(dh);
   const ctx=canvas.getContext('2d');
+  const editor=CURRENT_EDITOR,mask=editor?.brushMask,epoch=(canvas._maskEpoch||0)+1;canvas._maskEpoch=epoch;
+  canvas._maskLoading=!!mask;canvas.style.cursor=mask?'wait':'crosshair';
   ctx.clearRect(0,0,canvas.width,canvas.height);
-  if(CURRENT_EDITOR&&CURRENT_EDITOR.brushMask){
+  if(mask){
     const m=new Image();
-    m.onload=()=>{ctx.drawImage(m,0,0,canvas.width,canvas.height);};
-    m.src=CURRENT_EDITOR.brushMask;
+    m.onload=()=>{if(CURRENT_EDITOR===editor&&editor.brushMask===mask&&canvas._maskEpoch===epoch){ctx.drawImage(m,0,0,canvas.width,canvas.height);canvas._maskLoading=false;canvas.style.cursor='crosshair';}};
+    m.onerror=()=>{if(CURRENT_EDITOR===editor&&canvas._maskEpoch===epoch){canvas._maskLoading=false;canvas.style.cursor='crosshair';$('editStatus').textContent='画笔蒙版加载失败，请撤销或清除后重试';}};
+    m.src=mask;
   }
   if(canvas._bound)return;
   canvas._bound=true;
-  let drawing=false,last=null;
+  let drawing=false,last=null,activeEditor=null;
   const pos=e=>{
     const r=canvas.getBoundingClientRect();
     return {x:(e.clientX-r.left)*canvas.width/r.width,y:(e.clientY-r.top)*canvas.height/r.height};
@@ -3483,19 +3650,25 @@ function setupBrushCanvas(){
     c.restore();
   };
   canvas.onpointerdown=e=>{
-    if(!brushVisible()||CURRENT_EDITOR?.exporting)return;
+    if(!brushVisible()||CURRENT_EDITOR?.exporting||canvas._maskLoading)return;
+    // The before/after splitter also listens on the parent. Keep it from
+    // stealing pointer capture, otherwise real pointerup never commits a stroke.
+    e.preventDefault();e.stopPropagation();
+    activeEditor=CURRENT_EDITOR;
+    canvas._maskEpoch=(canvas._maskEpoch||0)+1;canvas._brushDrawing=true;
     canvas.setPointerCapture(e.pointerId);drawing=true;last=pos(e);stroke(last);last=pos(e);
   };
   canvas.onpointermove=e=>{
-    if(!drawing)return;const p=pos(e);stroke(p);last=p;
+    if(!drawing||CURRENT_EDITOR!==activeEditor||activeEditor.exporting||!brushVisible())return;const p=pos(e);stroke(p);last=p;
   };
   const end=()=>{
-    if(!drawing)return;drawing=false;last=null;commitBrushMask();
+    if(!drawing)return;drawing=false;canvas._brushDrawing=false;last=null;
+    const owner=activeEditor;activeEditor=null;if(CURRENT_EDITOR===owner)commitBrushMask();
   };
   canvas.onpointerup=canvas.onpointercancel=end;
 }
 function commitBrushMask(){
-  const editor=CURRENT_EDITOR;if(!editor||editor.operation==='color')return;
+  const editor=CURRENT_EDITOR;if(!editor||editor.operation==='color'||editor.exporting)return;
   const canvas=brushCanvas();if(!canvas)return;
   const data=canvas.toDataURL('image/png');
   editor.brushMask=data;
@@ -3505,8 +3678,10 @@ function commitBrushMask(){
   updateEditorHistory();scheduleEditorPreview(editor);projectChanged();
 }
 function clearBrushMask(){
-  const editor=CURRENT_EDITOR;if(!editor||editor.operation==='color')return;
+  const editor=CURRENT_EDITOR;if(!editor||editor.operation==='color'||editor.exporting)return;
   const canvas=brushCanvas();
+  if(canvas)canvas._maskEpoch=(canvas._maskEpoch||0)+1;
+  if(canvas){canvas._maskLoading=false;canvas.style.cursor='crosshair';}
   if(canvas)canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height);
   editor.brushMask=null;editor.retouch={...editor.retouch,brush_mask:null};
   editor.revision++;hideEditorMask(editor);
@@ -3523,9 +3698,9 @@ function renderEditorFrame(editor,result,revision,epoch){
   hideEditorMask(editor);image.onload=null;image.src=result.after;
   // 画笔层需在图片加载后按其自然尺寸对齐（object-fit:contain 的 letterbox）
   image.addEventListener('load',function brushSetup(){
-    if(CURRENT_EDITOR!==editor)return;
+    if(CURRENT_EDITOR!==editor||editor.revision!==revision||editor.renderEpoch!==epoch)return;
     if(brushVisible())setupBrushCanvas();
-  });
+  },{once:true});
   if(brushVisible())requestAnimationFrame(()=>setupBrushCanvas());
   if(!editor.showMask||typeof result.region_mask!=='string'||!result.region_mask)return;
   // Each detached image belongs to one response, so an old decode can never
@@ -3619,7 +3794,7 @@ function lockEditorExport(editor){
   const ids=['editExport','editReset','editUndo','editRedo','exportSize','exportQuality','recipeFile',
     'skin','retain','clarity','wb','faceRepair','blemish','strength','wbStrength','autoTone','localRegion','presetSelect','algo','preserveLuma','skinProtect'];
   for(const [key] of TONE_CONTROLS)ids.push('tone-'+key,...(editor.operation==='color'?[]:['edit-'+key]));
-  if(editor.operation!=='color')ids.push(...RETOUCH_CONTROLS.map(([key])=>'edit-retouch-'+key),'editRegion','editMask','editRetouchReset');
+  if(editor.operation!=='color')ids.push(...RETOUCH_CONTROLS.map(([key])=>'edit-retouch-'+key),'editRegion','editMask','editRetouchReset','editBrushSize','editBrushFeather','editBrushPaint','editBrushErase','editBrushClear');
   editor.lockedControls=new Map([...ids.map($),...$('wbSeg').querySelectorAll('button'),...document.querySelectorAll('.toneActions button')].filter(Boolean).map(input=>[input,input.disabled]));
   for(const input of editor.lockedControls.keys())input.disabled=true;
 }
@@ -3632,19 +3807,20 @@ async function exportEditor(){
   const editor=CURRENT_EDITOR;if(!editor||editor.exporting)return;
   flushEditorGesture();clearTimeout(editorTimer);editor.previewPending=false;editor.renderEpoch++;hideEditorMask(editor);
   const adjustments=editor.operation==='color'?{}:{...editor.tone};
+  const retouch=editor.operation==='color'?null:{...editor.retouch};
   const settings={...editor.settings,paths:[editor.path],export_size:$('exportSize').value,export_quality:+$('exportQuality').value};
-  if(editor.operation!=='color')settings.polish={...editor.settings.polish,...editor.retouch};
+  if(retouch)settings.polish={...editor.settings.polish,...Object.fromEntries(Object.entries(retouch).filter(([key])=>key!=='brush_mask'))};
   editor.exporting=true;lockEditorExport(editor);updateEditorHistory();
   $('editStatus').textContent='正在渲染成品…';
   try{
     // Prepared sessions freeze output settings. Prepare the selected size/quality before exporting.
     const prepared=await api('/api/prepare',settings);
     if(CURRENT_EDITOR!==editor)return;
-    const r=await api('/api/process_one',{sid:prepared.sid,path:editor.path,adjustments});
+    const r=await api('/api/process_one',{sid:prepared.sid,path:editor.path,adjustments,...(retouch?{retouch_adjustments:retouch}:{})});
     if(CURRENT_EDITOR!==editor)return;
     showEditorWarnings(r);
     $('editStatus').textContent=`已导出 ${r.width} × ${r.height} · `;
-    const link=document.createElement('a');link.href=r.after;link.download=r.out.split('/').pop();link.textContent='下载成品';$('editStatus').appendChild(link);
+    const link=document.createElement('a');link.href=r.after;link.download=baseName(r.out);link.textContent='下载成品';$('editStatus').appendChild(link);
     $('status').textContent='已导出成品：'+r.out;toast('成品已保存');
   }catch(e){if(CURRENT_EDITOR===editor)$('editStatus').textContent='导出失败：'+e.message;}
   finally{editor.exporting=false;unlockEditorExport(editor);if(CURRENT_EDITOR===editor)updateEditorHistory();}
@@ -3753,7 +3929,7 @@ async function applyBatchRating(rating){
   if(BATCH_BUSY||CULL_HISTORY.applying)return 0;
   const next=Number(rating);
   if(!Number.isInteger(next)||next<0||next>5){toast('请选择 1–5 星，或选择清除星级');return 0;}
-  const photos=library.filter(p=>selectedPaths.has(p.path));
+  const photos=selectedPhotos();
   if(!photos.length){toast('请先选择照片');return 0;}
   if(selectionCounts(photos).hidden&&!window.confirm(`为全部选中的 ${photos.length} 张照片${next?'设置 '+next+' 星':'清除星级'}？${selectionScopeNotice(photos)}`))return 0;
   BATCH_BUSY=true;syncBatchControls();
@@ -3780,8 +3956,8 @@ function applyBatchRatingFromControl(){
 }
 function syncBatchControls(){
   const selection=selectionCounts(),count=selection.total;
-  $('batchSelectionCount').textContent=`全部已选 ${count} · 当前可见 ${selection.visible} · 隐藏 ${selection.hidden}`;
-  $('batchSelectionCount').title='批量加星、从项目移除、移到废纸篓/回收站均作用于全部选中照片，包括筛选隐藏的照片';
+  $('batchSelectionCount').textContent=`${sizeFilterActive()?'大小范围内已选':'全部已选'} ${count} · 当前可见 ${selection.visible} · 隐藏 ${selection.hidden}`;
+  $('batchSelectionCount').title=sizeFilterActive()?'大小范围外的照片不会参与批量操作；其他筛选隐藏的已选照片会在确认时提示':'批量加星、从项目移除、移到废纸篓/回收站均作用于全部选中照片，包括筛选隐藏的照片';
   const busy=BATCH_BUSY||CULL_HISTORY.applying;
   $('clearHiddenSelection').hidden=!selection.hidden;
   $('clearHiddenSelection').disabled=busy;
@@ -3873,6 +4049,52 @@ async function replayCullingHistory(redo=false){
 function undoCulling(){return replayCullingHistory(false);}
 function redoCulling(){return replayCullingHistory(true);}
 function groupMetadata(p){return {group:p.group,group_size:p.group_size,group_rank:p.group_rank,group_best:p.group_best,flags:[...p.flags]};}
+const REGROUP={busy:false};
+async function regroupVisiblePhotos(){
+  if(REGROUP.busy)return false;
+  if(SCAN_ACTIVE||JOB||BATCH_BUSY||CULL_HISTORY.applying||PROJECT.blocked)return toast('请等待扫描、批量操作或项目恢复完成后识别相似'),false;
+  const matched=library.filter(matchesSizeFilter),oldGroups=new Set(matched.filter(isGroup).map(p=>p.group));
+  const scope=library.filter(p=>matchesSizeFilter(p)||isGroup(p)&&oldGroups.has(p.group));
+  if(!scope.length)return toast('当前大小范围内没有照片，请先调整大小过滤'),false;
+  if(scope.length>20000)return toast('每次最多识别 20000 张，请先用大小过滤缩小范围'),false;
+  if(oldGroups.size&&!window.confirm(`重新识别 ${scope.length} 张照片（含已有组成员）？会重建这些照片的分组，可撤销；保留选择和星级，不修改原片。`))return false;
+  const generation=libraryGeneration,signatures=new Map(scope.map(p=>[p.path,JSON.stringify(groupMetadata(p))]));
+  const current=()=>generation===libraryGeneration&&!SCAN_ACTIVE&&!JOB&&!BATCH_BUSY&&!CULL_HISTORY.applying&&scope.every(p=>libraryByPath.get(p.path)===p&&JSON.stringify(groupMetadata(p))===signatures.get(p.path));
+  REGROUP.busy=true;$('regroupButton').disabled=true;$('regroupStatus').textContent=`正在识别相似：0 / ${scope.length}`;
+  try{
+    const started=await api('/api/regroup',{photos:scope.map(({path,width,height,score})=>({path,width,height,score})),similarity_profile:$('similarityProfile').value||'balanced'});
+    let result;
+    do{
+      if(!current())throw new Error('图库或分组已改变，本次结果未应用');
+      result=await api('/api/regroup_status?job='+encodeURIComponent(started.job));
+      if(!current())throw new Error('图库或分组已改变，本次结果未应用');
+      $('regroupStatus').textContent=`正在识别相似：${result.done||0} / ${result.total||scope.length}`;
+      if(!result.finished)await new Promise(resolve=>setTimeout(resolve,400));
+    }while(!result.finished);
+    if(result.error)throw new Error(result.error);
+    if(!Array.isArray(result.photos)||!result.photos.length)throw new Error('没有可读取的预览，原分组已保留');
+    const seen=new Set();
+    for(const p of result.photos){
+      if(!p||!signatures.has(p.path)||seen.has(p.path)||!Number.isInteger(p.group)||p.group<0||!Number.isInteger(p.group_size)||p.group_size<1||!Number.isInteger(p.group_rank)||p.group_rank<1||p.group_rank>p.group_size||typeof p.group_best!=='boolean')throw new Error('相似识别结果无效，原分组已保留');
+      seen.add(p.path);
+    }
+    const before=new Map(library.map(p=>[p.path,groupMetadata(p)])),affected=new Set(scope.filter(p=>p.group>=0).map(p=>p.group));
+    const used=new Set(library.filter(p=>!seen.has(p.path)&&p.group>=0).map(p=>p.group));let next=0;
+    const ids=new Map();
+    for(const p of result.photos){if(!ids.has(p.group)){while(used.has(next))next++;ids.set(p.group,next);used.add(next++);}const photo=libraryByPath.get(p.path);photo.group=ids.get(p.group);affected.add(photo.group);}
+    const members=new Map();
+    for(const p of library){if(!affected.has(p.group))continue;if(!members.has(p.group))members.set(p.group,[]);members.get(p.group).push(p);}
+    for(const group of members.values()){
+      group.sort((a,b)=>b.score-a.score||a.path.localeCompare(b.path));
+      group.forEach((p,i)=>{p.group_size=group.length;p.group_rank=i+1;p.group_best=i===0;p.flags=p.flags.filter(f=>f!=='连拍重复');if(i>0&&group.length>1)p.flags.push('连拍重复');});
+    }
+    const changes=library.flatMap(p=>{const prior=before.get(p.path),after=groupMetadata(p);return JSON.stringify(prior)===JSON.stringify(after)?[]:[{path:p.path,before:prior,after}];});
+    pushCullingHistory({type:'groups',label:'重新识别相似',changes});rebuildView();projectChanged();
+    $('regroupStatus').textContent=`相似识别完成 · ${new Set(result.photos.filter(p=>p.group_size>=2).map(p=>p.group)).size} 组`+(result.skipped?` · ${result.skipped} 张未读取`:'');
+    return true;
+  }catch(error){$('regroupStatus').textContent='相似识别未应用：'+error.message;return false;}
+  finally{REGROUP.busy=false;$('regroupButton').disabled=false;}
+}
 function editSimilarGroups(kind){
   if(!['split','merge'].includes(kind)||BATCH_BUSY||CULL_HISTORY.applying||SCAN_ACTIVE||JOB||PROJECT.blocked)return false;
   const photos=selectedPhotos();if(photos.length<(kind==='merge'?2:1))return toast(kind==='merge'?'请至少选择两张照片':'请先选择照片'),false;
@@ -3904,7 +4126,7 @@ function cullingHistoryShortcut(e){
   if(!(redo?CULL_HISTORY.redo:CULL_HISTORY.undo).length)return false;
   e.preventDefault();replayCullingHistory(redo);return true;
 }
-function selectedPhotos(){return library.filter(p=>selectedPaths.has(p.path));}
+function selectedPhotos(){return library.filter(p=>selectedPaths.has(p.path)&&matchesSizeFilter(p));}
 function selectionCounts(photos=selectedPhotos()){
   const visiblePaths=new Set(ranked.map(p=>p.path));
   const visible=photos.reduce((n,p)=>n+(visiblePaths.has(p.path)?1:0),0);
@@ -3993,7 +4215,7 @@ async function deleteSelectedToTrash(){
     if(failed.length)toast(`已移到废纸篓/回收站 ${removed.size} 张；${failed.length} 张失败并留在项目中`);
     else toast(`已将 ${removed.size} 张原片移到系统废纸篓/回收站`);
     const details=[...(response.warnings||[]).map(item=>item.message),
-      ...failed.map(item=>`${item.path.split('/').pop()}：${item.error}`)];
+      ...failed.map(item=>`${baseName(item.path)}：${item.error}`)];
     if(details.length)$('status').textContent=details.join('；');
     return removed.size;
   }finally{BATCH_BUSY=false;syncBatchControls();}
@@ -4025,12 +4247,12 @@ function syncCompareMetadata(){
   for(const pane of comparePanes()){
     const p=compareItems.find(item=>item.path===pane.dataset.path);if(!p)continue;
     pane.classList.toggle('active',p.path===compareActivePath);
-    pane.setAttribute('aria-label',`${p.path.split('/').pop()}${p.path===compareActivePath?' · 当前操作照片':''}`);
+    pane.setAttribute('aria-label',`${baseName(p.path)}${p.path===compareActivePath?' · 当前操作照片':''}`);
     const star=pane.querySelector('.compareStar');
     if(star){star.textContent=p.rating?'★'+p.rating:'☆';star.classList.toggle('on',!!p.rating);star.setAttribute('aria-pressed',String(!!p.rating));}
   }
   const p=compareItems.find(item=>item.path===compareActivePath);
-  if($('compareActiveName'))$('compareActiveName').textContent=p?'当前：'+p.path.split('/').pop():'';
+  if($('compareActiveName'))$('compareActiveName').textContent=p?'当前：'+baseName(p.path):'';
   if($('compareRating'))$('compareRating').value=p?.rating||0;
   if($('compareKeep'))$('compareKeep').setAttribute('aria-pressed',String(!!p&&selectedPaths.has(p.path)));
   if($('compareReject'))$('compareReject').setAttribute('aria-pressed',String(!!p&&!selectedPaths.has(p.path)));
@@ -4052,8 +4274,8 @@ function renderGroupCompare(items){
   $('compareTitle').textContent=`相似照片对比 · ${items.length} 张`;
   for(const p of items){
     const pane=document.createElement('div');pane.className='comparePane';pane.dataset.path=p.path;pane.tabIndex=0;
-    pane.innerHTML=`<img alt="${escapeHtml(p.path.split('/').pop())}"><span class="compareImageStatus" role="status">加载预览…</span>
-      <div class="compareMeta"><span title="${escapeHtml(p.path.split('/').pop())}">${escapeHtml(p.path.split('/').pop())} · ${Number(p.score||0).toFixed(2)}</span>
+    pane.innerHTML=`<img alt="${escapeHtml(baseName(p.path))}"><span class="compareImageStatus" role="status">加载预览…</span>
+      <div class="compareMeta"><span title="${escapeHtml(baseName(p.path))}">${escapeHtml(baseName(p.path))} · ${Number(p.score||0).toFixed(2)}</span>
       <button class="compareStar" type="button" aria-label="切换五星标记">☆</button></div>`;
     const img=pane.querySelector('img'),status=pane.querySelector('.compareImageStatus');
     img.onload=()=>{if(session!==compareSession)return;status.hidden=true;updateCompareView();};
@@ -4150,7 +4372,7 @@ $('compareZoom').oninput=e=>{delete compareView.pixelPath;compareView.zoom=+e.ta
 $('compareModal').onclick=e=>{if(e.target===$('compareModal'))closeGroupCompare();};
 
 /* ── 快审灯箱：双击卡片进入，键盘批量审片，星级写 XMP sidecar ── */
-let LBI=-1;
+let LBI=-1,lbPreviewSeq=0,lbPrefetchTimer=null;
 const lbStars=$('lbStars');
 for(let i=1;i<=5;i++){
   const b=document.createElement('button');b.textContent='★';b.dataset.v=i;
@@ -4162,7 +4384,11 @@ function lbRenderStars(r){
     if(b.className==='clr'){b.classList.toggle('on',r===0);return;}
     b.classList.toggle('on',+b.dataset.v<=r);});}
 function lbShow(i){LBI=i;$('lb').classList.add('show');lbUpdate(true);}
-function lbHide(){$('lb').classList.remove('show');}
+function lbHide(){
+  const path=ranked[LBI]?.path;
+  ++lbPreviewSeq;++lbExifSeq;clearTimeout(lbPrefetchTimer);$('lb').classList.remove('show');
+  cardCache.get(path)?.focus?.({preventScroll:true});
+}
 function lbCard(p){return cardCache.get(p.path);}
 let lbExifSeq=0;
 function lbRenderExif(ex){
@@ -4195,7 +4421,7 @@ function lbLoadExif(){
 }
 function lbUpdate(reload){
   const p=ranked[LBI];if(!p)return;
-  $('lbName').textContent=p.path.split('/').pop();
+  $('lbName').textContent=baseName(p.path);
   $('lbIdx').textContent=(LBI+1)+' / '+ranked.length;
   lbRenderStars(p.rating||0);
   lbLoadExif();
@@ -4203,13 +4429,22 @@ function lbUpdate(reload){
     +(p.faces?`<span>人脸 <b>${p.faces}</b></span>`:'')
     +(p.flags.length?p.flags.map(f=>`<span>${escapeHtml(f)}</span>`).join(''):'<span><b>通过</b></span>');
   if(reload){
-    const img=$('lbImg');img.alt=p.path.split('/').pop()+' 预览';
-    img.classList.remove('ld');$('lbSpin').style.display='block';$('lbSpin').textContent='加载中…';
-    img.onload=()=>{img.classList.add('ld');$('lbSpin').style.display='none';};
-    img.onerror=()=>{$('lbSpin').textContent='无法预览此文件';};
-    img.src='/api/raw_img?p='+encodeURIComponent(p.path);
-    const nb=ranked[(LBI+1)%ranked.length];            // 预取下一张，翻页秒开
-    if(nb){const pre=new Image();pre.src='/api/raw_img?p='+encodeURIComponent(nb.path);}}
+    const sequence=++lbPreviewSeq;clearTimeout(lbPrefetchTimer);
+    const img=$('lbImg');img.alt=baseName(p.path)+' 预览';
+    const current=()=>sequence===lbPreviewSeq&&$('lb').classList.contains('show')&&ranked[LBI]?.path===p.path;
+    img.classList.remove('ld');$('lbSpin').style.display='block';$('lbSpin').textContent='正在载入清晰预览…';
+    img.onload=()=>{if(current()){img.classList.add('ld');$('lbSpin').style.display='none';}};
+    img.onerror=()=>{if(current())$('lbSpin').textContent='缩略图暂不可用，正在载入清晰预览…';};
+    img.src=p.thumb||'/api/thumb?p='+encodeURIComponent(p.path)+'&s=360';
+    const full=new Image();
+    full.onload=()=>{if(!current())return;img.src=full.src;img.classList.add('ld');$('lbSpin').style.display='none';};
+    full.onerror=()=>{if(current()){$('lbSpin').textContent='清晰预览暂不可用；可继续查看缩略图';$('lbSpin').style.display='block';}};
+    full.src='/api/raw_img?p='+encodeURIComponent(p.path);
+    lbPrefetchTimer=setTimeout(()=>{
+      if(!current())return;const nb=ranked[(LBI+1)%ranked.length];
+      if(nb&&nb.path!==p.path){const pre=new Image();pre.src='/api/raw_img?p='+encodeURIComponent(nb.path);}
+    },350);
+  }
   document.querySelectorAll('.card.lbcur').forEach(c=>c.classList.remove('lbcur'));
   const card=lbCard(p);if(card){card.classList.add('lbcur');
     if(card.scrollIntoView)card.scrollIntoView({block:'nearest'});}}
@@ -4230,6 +4465,20 @@ async function lbRate(r){
   return setRating(p,r);
 }
 
+function quickLookSpaceEvent(e){
+  if(e.key!==' '||e.repeat||e.isComposing||e.metaKey||e.ctrlKey||e.altKey||e.shiftKey)return false;
+  const target=e.target||document.activeElement;
+  if(/^(INPUT|TEXTAREA|SELECT|BUTTON|SUMMARY|A)$/i.test(target?.tagName||'')||target?.isContentEditable||target?.closest?.('button,a,input,textarea,select,summary,[contenteditable="true"]'))return false;
+  return true;
+}
+function gridQuickLookShortcut(e){
+  if(!quickLookSpaceEvent(e))return false;
+  if(['results','lb','compareModal'].some(id=>$(id).classList.contains('show'))||CURRENT_EDITOR||BATCH_BUSY)return false;
+  let index=ranked.findIndex(p=>p.path===activePhotoPath);
+  if(index<0)index=ranked.findIndex(p=>selectedPaths.has(p.path));
+  if(index<0)return false;
+  e.preventDefault();lbShow(index);return true;
+}
 function gridRatingShortcut(e){
   if(e.repeat||e.isComposing||e.metaKey||e.ctrlKey||e.altKey||e.shiftKey||! /^[0-5]$/.test(e.key))return false;
   const target=e.target||document.activeElement;
@@ -4247,13 +4496,7 @@ document.addEventListener('keydown',e=>{
     if(e.key==='Escape')lbHide();
     else if(e.key==='ArrowRight'||(e.key.toLowerCase()==='j'&&!/input|select/i.test(tag)))lbNav(1);
     else if(e.key==='ArrowLeft'||(e.key.toLowerCase()==='k'&&!/input|select/i.test(tag)))lbNav(-1);
-    else if(e.key===' '){e.preventDefault();
-      const p=ranked[LBI];if(!p)return;
-      if(CULL_HISTORY.applying)return;const before=new Set(selectedPaths);
-      selectionTouched=true;
-      if(selectedPaths.has(p.path))selectedPaths.delete(p.path);else selectedPaths.add(p.path);
-      const card=lbCard(p);if(card)card.classList.toggle('sel',selectedPaths.has(p.path));
-      recordSelection(before,'快审保留');updateStats();projectChanged();toast(selectedPaths.has(p.path)?'已加入保留':'已移出保留');}
+    else if(quickLookSpaceEvent(e)){e.preventDefault();lbHide();}
     else if(/^[0-5]$/.test(e.key)&&!/input|select/i.test(tag))lbRate(+e.key);
     return;}
   if($('results').classList.contains('show')&&e.key==='Escape'){
@@ -4261,7 +4504,9 @@ document.addEventListener('keydown',e=>{
   }
   if(editorShortcut(e))return;
   if(cullingHistoryShortcut(e))return;
+  if(gridQuickLookShortcut(e))return;
   if(gridRatingShortcut(e))return;
+  if(e.key==='Escape'&&!$('side').hidden){setSidebarOpen(false,true);return;}
   if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='a'&&!/input|select/i.test(tag)){
     e.preventDefault();selAll(1);}});
 bindViewControls();

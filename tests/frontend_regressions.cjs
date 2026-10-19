@@ -63,6 +63,140 @@ async function main() {
     try { await fn(); console.log('PASS', name); }
     catch (e) { failures++; console.error('FAIL', name, e.message); }
   };
+  await test('Windows, POSIX and UNC photo paths expose only the basename',async()=>{
+    const p=await page();
+    assert.equal(p.run('baseName("C:\\\\photos\\\\2026\\\\motorcycle.ARW")'),'motorcycle.ARW');
+    assert.equal(p.run('baseName("/Users/test/Pictures/a.jpg")'),'a.jpg');
+    assert.equal(p.run('baseName("\\\\\\\\server\\\\share\\\\event\\\\bride.jpg")'),'bride.jpg');
+    assert.equal(p.run('baseName("C:\\\\photos\\\\")'),'photos');
+    assert.equal(p.run('baseName("")'),'');
+  });
+  await test('Space opens the active selected photo without altering selection',async()=>{
+    const p=await page();
+    p.run('library=['+JSON.stringify(photo('/a.jpg'))+','+JSON.stringify(photo('/b.jpg'))+'];ranked=library;selectedPaths=new Set(library.map(p=>p.path));activePhotoPath="/b.jpg";lbShow=i=>{globalThis.opened=i;};');
+    p.context.event={key:' ',target:{tagName:'DIV'},preventDefault(){this.prevented=true;}};
+    assert.equal(p.run('gridQuickLookShortcut(event)'),true);
+    assert.equal(p.run('opened'),1);
+    assert.equal(p.run('selectedPaths.size'),2);
+    for(const tag of ['INPUT','TEXTAREA','SELECT','BUTTON','SUMMARY','A']){
+      p.context.event={key:' ',target:{tagName:tag},preventDefault(){throw Error('must not intercept');}};
+      assert.equal(p.run('gridQuickLookShortcut(event)'),false);
+    }
+  });
+  await test('Space in quicklook returns to the gallery without changing photo selection',async()=>{
+    const p=await page();
+    p.run('library=['+JSON.stringify(photo('/a.jpg'))+'];ranked=library;selectedPaths=new Set(["/a.jpg"]);lbShow(0);');
+    const event={key:' ',target:{tagName:'DIV'},preventDefault(){this.prevented=true;}};
+    for(const fn of p.listeners.keydown||[])fn(event);
+    assert.equal(p.get('lb').classList.contains('show'),false);
+    assert.equal(p.run('selectedPaths.has("/a.jpg")'),true);
+    assert.equal(p.run('selectionTouched'),false);
+    assert.equal(event.prevented,true);
+  });
+  await test('held modified or editable Space does not close quicklook or change selection',async()=>{
+    const p=await page();p.run('ranked=['+JSON.stringify(photo('/a.jpg'))+'];selectedPaths=new Set(["/a.jpg"]);lbShow(0);');
+    for(const extra of [{repeat:true},{isComposing:true},{ctrlKey:true},{metaKey:true},{altKey:true},{shiftKey:true},{target:{tagName:'DIV',isContentEditable:true}},{target:{tagName:'BUTTON'}}]){
+      const event={key:' ',target:{tagName:'DIV'},preventDefault(){throw Error('must not intercept');},...extra};
+      for(const fn of p.listeners.keydown||[])fn(event);
+      assert.equal(p.get('lb').classList.contains('show'),true);
+      assert.equal(p.run('selectedPaths.size'),1);
+    }
+  });
+  await test('quicklook displays a thumbnail before the high resolution preview and ignores stale loads',async()=>{
+    const p=await page();p.run('ranked=['+JSON.stringify(photo('/a.jpg'))+','+JSON.stringify(photo('/b.jpg'))+'];lbShow(0)');
+    assert.equal(p.get('lbImg').src,'/thumb');
+    const old=p.images.find(image=>image.src?.includes('raw_img'));
+    assert.ok(old);
+    p.run('lbNav(1)');old.onload();
+    assert.equal(p.get('lbImg').src,'/thumb');
+    const current=p.images.filter(image=>image.src?.includes('raw_img')).at(-1);
+    current.onload();assert.match(p.get('lbImg').src,/b.jpg/);
+    p.run('lbHide()');current.onload();assert.equal(p.get('lb').classList.contains('show'),false);
+  });
+  await test('similarity rebuild preserves stars selections and ignores replaced libraries',async()=>{
+    const wait=deferred();let delayed=false;
+    const p=await page(async(path,body)=>{
+      if(path==='/api/regroup')return {job:'similar-1'};
+      if(path.startsWith('/api/regroup_status'))return delayed?wait.promise:{finished:true,done:2,total:2,skipped:0,photos:[{path:'/a.jpg',group:0,group_size:2,group_rank:1,group_best:true},{path:'/b.jpg',group:0,group_size:2,group_rank:2,group_best:false}]};
+      return path==='/api/project'?{state:null}:{presets:[]};
+    });await tick();
+    p.run('library=['+JSON.stringify({...photo('/a.jpg'),rating:4})+','+JSON.stringify({...photo('/b.jpg'),rating:2})+'];library.forEach(p=>libraryByPath.set(p.path,p));ranked=library;selectedPaths=new Set(["/b.jpg"]);');
+    await p.run('regroupVisiblePhotos()');
+    assert.equal(p.run('library[0].group_size'),2);
+    assert.deepEqual(json(p,'library.map(p=>p.rating)'),[4,2]);
+    assert.deepEqual(json(p,'[...selectedPaths]'),['/b.jpg']);
+    delayed=true;const task=p.run('regroupVisiblePhotos()');await tick();
+    p.run('replaceProjectLibrary(['+JSON.stringify(photo('/new.jpg'))+']);');
+    wait.resolve({finished:true,photos:[]});await task;
+    assert.deepEqual(json(p,'library.map(p=>p.path)'),['/new.jpg']);
+  });
+  for(const busyState of ['CULL_HISTORY.applying','BATCH_BUSY'])await test('similarity rebuild preserves original groups when '+busyState+' starts while awaiting results',async()=>{
+    const wait=deferred();let statusRequested=false;
+    const p=await page(async path=>{
+      if(path==='/api/regroup')return {job:'similar-busy'};
+      if(path.startsWith('/api/regroup_status')){statusRequested=true;return wait.promise;}
+      return path==='/api/project'?{state:null}:{presets:[]};
+    });await tick();
+    p.run('library=['+JSON.stringify({...photo('/a.jpg'),group:4,group_size:1,group_rank:1,group_best:true})+','+JSON.stringify({...photo('/b.jpg'),group:5,group_size:1,group_rank:1,group_best:true})+'];library.forEach(p=>libraryByPath.set(p.path,p));ranked=library;');
+    const before=json(p,'library.map(groupMetadata)');
+    const task=p.run('regroupVisiblePhotos()');await tick();await tick();assert.equal(statusRequested,true,p.get('regroupStatus').textContent);
+    p.run(busyState+'=true');
+    wait.resolve({finished:true,done:2,total:2,skipped:0,photos:[{path:'/a.jpg',group:0,group_size:2,group_rank:1,group_best:true},{path:'/b.jpg',group:0,group_size:2,group_rank:2,group_best:false}]});
+    assert.equal(await task,false);
+    assert.deepEqual(json(p,'library.map(groupMetadata)'),before);
+    assert.equal(p.run('CULL_HISTORY.undo.length'),0);
+    assert.equal(p.run('REGROUP.busy'),false);
+    assert.equal(p.get('regroupButton').disabled,false);
+    assert.match(p.get('regroupStatus').textContent,/未应用/);
+  });
+  await test('size range uses original short edge and inclusive MB boundaries',async()=>{
+    const p=await page();
+    p.context.photos=[{...photo('/icon.png'),original_width:64,original_height:64,file_size:300},
+      {...photo('/a.jpg'),width:1024,height:680,original_width:3000,original_height:2000,file_size:1048576},
+      {...photo('/b.jpg'),original_width:2000,original_height:3000,file_size:2097152},
+      {...photo('/c.jpg'),original_width:4000,original_height:3000,file_size:3145728}];
+    p.run('sizeFilter={minEdge:1500,maxEdge:2500,minMB:1,maxMB:2};');
+    assert.deepEqual(json(p,'filterPhotos(photos).map(p=>p.path)'),['/a.jpg','/b.jpg']);
+    p.run('filterMode="starred"');assert.deepEqual(json(p,'filterPhotos(photos)'),[]);
+  });
+  await test('unknown dimensions stay visible by default but not in an active pixel range',async()=>{
+    const p=await page();p.context.photos=[photo('/legacy.arw')];
+    assert.equal(p.run('filterPhotos(photos).length'),1);
+    p.run('sizeFilter={minEdge:600,maxEdge:null,minMB:null,maxMB:null}');
+    assert.equal(p.run('filterPhotos(photos).length'),0);
+    p.run('photos[0].file_size=1048576;sizeFilter={minEdge:null,maxEdge:null,minMB:1,maxMB:2}');
+    assert.equal(p.run('filterPhotos(photos).length'),1);
+  });
+  await test('invalid size ranges preserve prior filter and expose a useful error',async()=>{
+    const p=await page();p.get('sizeMinEdge').value='900';p.get('sizeMaxEdge').value='500';
+    assert.equal(p.run('applySizeFilter()'),false);
+    assert.match(p.get('sizeFilterStatus').textContent,/下限.*上限/);
+    assert.equal(p.run('sizeFilter.minEdge'),null);
+    assert.throws(()=>p.run('validateSizeFilter({minEdge:-1,maxEdge:null,minMB:null,maxMB:null})'));
+  });
+  await test('size filter persists and old checkpoints default to unrestricted',async()=>{
+    const p=await page();p.run('sizeFilter={minEdge:600,maxEdge:null,minMB:.2,maxMB:50}');
+    assert.deepEqual(json(p,'projectSnapshot().settings.sizeFilter'),{minEdge:600,maxEdge:null,minMB:.2,maxMB:50});
+    const state=await checkpoint(p);delete state.settings.sizeFilter;
+    p.context.settings=state.settings;assert.doesNotThrow(()=>p.run('validateProjectSettings(settings)'));
+  });
+  await test('active size filtering excludes hidden icons from batch rating and deletion scope',async()=>{
+    const requests=[];
+    const p=await page(async(path,body)=>{requests.push({path,body});return path==='/api/project'?(body?{ok:true}:{state:null}):path==='/api/rate'?{ok:true}:path==='/api/trash'?{removed:body.paths,failed:[],warnings:[]}:{presets:[]};});await tick();
+    p.run('library=[{...'+JSON.stringify(photo('/icon.png'))+',original_width:64,original_height:64},{...'+JSON.stringify(photo('/photo.jpg'))+',original_width:3000,original_height:2000}];library.forEach(p=>libraryByPath.set(p.path,p));selectedPaths=new Set(library.map(p=>p.path));sizeFilter={minEdge:600,maxEdge:null,minMB:null,maxMB:null};ranked=filterPhotos(library);');
+    assert.deepEqual(json(p,'selectedPhotos().map(p=>p.path)'),['/photo.jpg']);
+    await p.run('applyBatchRating(3)');
+    assert.equal(requests.filter(r=>r.path==='/api/rate').length,1);
+    assert.equal(requests.find(r=>r.path==='/api/rate').body.path,'/photo.jpg');
+    assert.equal(p.run('selectedPaths.has("/icon.png")'),true);
+    p.run('PROJECT.folder="/photos";PROJECT.ready=true;PROJECT.blocked=false;');
+    await p.run('deleteSelectedToTrash()');
+    assert.deepEqual(requests.find(r=>r.path==='/api/trash').body.paths,['/photo.jpg']);
+    assert.equal(p.run('libraryByPath.has("/icon.png")'),true);
+    p.run('const extra={...library[0],path:"/another.jpg",original_width:3000,original_height:2000};library.push(extra);libraryByPath.set(extra.path,extra);selectedPaths.add(extra.path);ranked=filterPhotos(library);');
+    await p.run('removeSelectedFromProject()');
+    assert.deepEqual(json(p,'library.map(p=>p.path)'),['/icon.png']);
+  });
   await test('equal-scoring similar groups remain contiguous', () => {
     const context = vm.createContext({});
     vm.runInContext("let sortMode='smart';" + block('function isGroup', 'function filterPhotos'), context);
@@ -277,7 +411,7 @@ async function main() {
   await test('selection toolbar separates project removal from recoverable local trash',()=>{
     assert.match(source,/id="projectRemoveBtn"[^>]*onclick="removeSelectedFromProject\(\)"/);
     assert.match(source,/id="trashBtn"[^>]*onclick="deleteSelectedToTrash\(\)"/);
-    assert.match(source,/删除原片可从 macOS 废纸篓恢复/);
+    assert.match(source,/删除原片可从系统废纸篓\/回收站恢复/);
   });
   await test('selection counters explicitly distinguish visible selected from all selected',async()=>{
     const p=await page();p.run(block('function updateStats()', 'function updateTargetUI()'));
@@ -445,7 +579,7 @@ async function main() {
   await test('trash action saves project removal before calling the local-trash endpoint',async()=>{
     const order=[];const p=await page(async(path,body)=>{if(body&&path==='/api/project'){order.push(['save',body.photos.length]);return {ok:true,saved_at:1};}if(path==='/api/trash'){order.push(['trash',body.paths]);return {removed:body.paths,failed:[],warnings:[]};}return {state:null};});await tick();
     p.run('PROJECT.ready=true;PROJECT.blocked=false;PROJECT.folder="/photos";library=['+JSON.stringify(photo('/photos/a.jpg'))+'];libraryByPath.set(library[0].path,library[0]);selectedPaths=new Set([library[0].path]);');
-    assert.equal(await p.run('deleteSelectedToTrash()'),1);assert.equal(p.run('library.length'),0);assert.deepEqual(order,[['save',0],['trash',['/photos/a.jpg']]]);assert.match(p.confirmations[0],/移到 macOS 废纸篓/);
+    assert.equal(await p.run('deleteSelectedToTrash()'),1);assert.equal(p.run('library.length'),0);assert.deepEqual(order,[['save',0],['trash',['/photos/a.jpg']]]);assert.match(p.confirmations[0],/移到系统废纸篓\/回收站/);
   });
   await test('local deletion never starts if project checkpointing fails',async()=>{
     const trashRequests=[];const p=await page(async(path,body)=>{if(path==='/api/project'&&body)return {ok:false};if(path==='/api/trash')trashRequests.push(body);return {state:null};});await tick();
@@ -666,7 +800,7 @@ async function main() {
     const p=await editorPage();await p.open();const opening=json(p,'CURRENT_EDITOR.settings');const global=json(p,'recipeValues()');
     for(const [key,value] of Object.entries({skin:.72,retain:.64,clarity:.36,face_repair:.8,blemish:.6}))p.retouch(key,value);
     p.region('eyes');await p.run('refreshEditorPreview()');const body=p.requests.at(-1).body;
-    assert.deepEqual(body.retouch_adjustments,{skin:.72,retain:.64,clarity:.36,face_repair:.8,blemish:.6,local_region:'eyes'});assert.equal('show_mask' in body,false);
+    assert.deepEqual(body.retouch_adjustments,{skin:.72,retain:.64,clarity:.36,face_repair:.8,blemish:.6,ai_denoise:0,local_region:'eyes',brush_mask:null});assert.equal('show_mask' in body,false);
     assert.deepEqual(json(p,'CURRENT_EDITOR.settings'),opening);assert.deepEqual(json(p,'recipeValues()'),global);
     assert.equal(p.get('editToneTab').getAttribute?.('aria-selected')||p.get('editToneTab').ariaSelected,'true');
     p.run('selectEditorPanel("portrait")');assert.equal(p.get('editPortraitControls').hidden,false);assert.equal(p.get('editTonePanel').hidden,true);
@@ -699,7 +833,69 @@ async function main() {
     for(const id of ['edit-retouch-skin','edit-retouch-retain','edit-retouch-clarity','edit-retouch-face_repair','edit-retouch-blemish','editRegion','editMask','editRetouchReset'])assert.equal(p.get(id).disabled,true,id);
     const prep=p.requests.filter(r=>r.path==='/api/prepare').at(-1).body;assert.equal(prep.polish.skin,.83);assert.equal(prep.polish.local_region,'background');assert.equal('show_mask' in prep,false);assert.deepEqual(json(p,'CURRENT_EDITOR.settings'),base);
     p.retouch('skin',.2);p.run('resetEditorRetouch()');assert.equal(p.run('CURRENT_EDITOR.retouch.skin'),.83);if(ending==='close')p.run('closeResults()');pending.resolve({sid:'frozen',count:1});await work;assert.equal(p.get('edit-retouch-skin').disabled,false);assert.equal(p.get('editMask').disabled,true);
-    if(ending==='complete'){const out=p.requests.at(-1).body;assert.equal(out.sid,'frozen');assert.equal('show_mask' in out,false);assert.equal('retouch_adjustments' in out,false);}
+    if(ending==='complete'){const out=p.requests.at(-1).body;assert.equal(out.sid,'frozen');assert.equal('show_mask' in out,false);assert.deepEqual(out.retouch_adjustments,Object.fromEntries(Object.keys(out.retouch_adjustments).map(key=>[key,key==='brush_mask'?null:prep.polish[key]])));}
+  });
+  await test('reopening a brush draft restores the mask and subsequent sliders retain it',async()=>{
+    const p=await editorPage();await p.open();
+    p.run('beginEditorGesture();CURRENT_EDITOR.brushMask="data:image/png;base64,TEST";CURRENT_EDITOR.retouch.brush_mask=CURRENT_EDITOR.brushMask;flushEditorGesture();closeResults();');
+    await p.open();assert.equal(p.run('CURRENT_EDITOR.brushMask'),'data:image/png;base64,TEST');
+    p.retouch('clarity',.7);assert.equal(p.run('CURRENT_EDITOR.retouch.brush_mask'),'data:image/png;base64,TEST');
+  });
+  await test('export freezes the brush mask and blocks clear until its request completes',async()=>{
+    const pending=deferred();let hold=false;const p=await editorPage(path=>path==='/api/prepare'&&hold?pending.promise:undefined);await p.open();
+    p.get('editBrushCanvas').getContext=()=>({clearRect(){}});
+    p.run('beginEditorGesture();CURRENT_EDITOR.brushMask="data:image/png;base64,TEST";CURRENT_EDITOR.retouch.brush_mask=CURRENT_EDITOR.brushMask;flushEditorGesture();');
+    hold=true;const work=p.run('exportEditor()');await tick();
+    const disabled=p.get('editBrushClear').disabled;p.run('clearBrushMask()');const retained=p.run('CURRENT_EDITOR.retouch.brush_mask');
+    pending.resolve({sid:'brush-frozen',count:1});await work;
+    assert.equal(disabled,true);assert.equal(retained,'data:image/png;base64,TEST');
+    assert.equal(p.requests.at(-1).body.retouch_adjustments.brush_mask,'data:image/png;base64,TEST');
+    assert.equal(p.get('editBrushClear').disabled,false);
+  });
+  await test('late brush image decode cannot overwrite a newer mask or closed editor',async()=>{
+    const p=await editorPage();await p.open();let draws=0;
+    const canvas=p.get('editBrushCanvas');canvas._bound=true;canvas.getContext=()=>({clearRect(){},drawImage(){draws++;}});
+    canvas.closest=()=>({getBoundingClientRect:()=>({width:800,height:600}),querySelector:()=>({naturalWidth:800,naturalHeight:600})});
+    p.run('CURRENT_EDITOR.brushMask="mask-a";setupBrushCanvas();CURRENT_EDITOR.brushMask="mask-b";setupBrushCanvas();');
+    const a=p.images.find(i=>i.src==='mask-a'),b=p.images.find(i=>i.src==='mask-b');a.onload();assert.equal(draws,0);b.onload();assert.equal(draws,1);
+    p.run('CURRENT_EDITOR.brushMask="mask-c";setupBrushCanvas();closeResults();');p.images.find(i=>i.src==='mask-c').onload();assert.equal(draws,1);
+  });
+  await test('brush loading and export cannot overwrite an active pointer stroke',async()=>{
+    const p=await editorPage();await p.open();let strokes=0,clears=0;
+    const ctx={clearRect(){clears++;},drawImage(){},save(){},restore(){},beginPath(){},moveTo(){},lineTo(){},stroke(){strokes++;},arc(){},fill(){}};
+    const canvas=p.get('editBrushCanvas');canvas.getContext=()=>ctx;canvas.setPointerCapture=()=>{};
+    canvas.getBoundingClientRect=()=>({left:0,top:0,width:800,height:600});
+    canvas.closest=()=>({getBoundingClientRect:canvas.getBoundingClientRect,querySelector:()=>({naturalWidth:800,naturalHeight:600})});
+    p.run('CURRENT_EDITOR.retouch.local_region="brush";CURRENT_EDITOR.brushMask="loading-mask";setupBrushCanvas();');
+    const event={clientX:100,clientY:100,pointerId:1,preventDefault(){},stopPropagation(){}};
+    canvas.onpointerdown(event);assert.equal(strokes,0,'wait until saved bitmap is restored before painting');
+    p.images.find(i=>i.src==='loading-mask').onload();canvas.onpointerdown(event);assert.ok(strokes>0);
+    const beforeClear=clears;p.run('setupBrushCanvas()');assert.equal(clears,beforeClear,'preview load cannot clear a live stroke');
+    p.run('CURRENT_EDITOR.exporting=true');const beforeStroke=strokes;canvas.onpointermove(event);assert.equal(strokes,beforeStroke,'export freezes active pointer rendering');
+  });
+  await test('a reused brush canvas belongs to the editor that starts each stroke',async()=>{
+    const p=await editorPage();await p.open();let strokes=0;
+    const ctx={clearRect(){},drawImage(){},save(){},restore(){},beginPath(){},moveTo(){},lineTo(){},stroke(){strokes++;},arc(){},fill(){}};
+    const canvas=p.get('editBrushCanvas');canvas.getContext=()=>ctx;canvas.setPointerCapture=()=>{};
+    canvas.toDataURL=()=> 'data:image/png;base64,NEW-STROKE';
+    canvas.getBoundingClientRect=()=>({left:0,top:0,width:800,height:600});
+    canvas.closest=()=>({getBoundingClientRect:canvas.getBoundingClientRect,querySelector:()=>({naturalWidth:800,naturalHeight:600})});
+    const event={clientX:100,clientY:100,pointerId:1,preventDefault(){},stopPropagation(){}};
+    p.run('CURRENT_EDITOR.retouch.local_region="brush";setupBrushCanvas();closeResults();');
+    await p.open();p.run('CURRENT_EDITOR.retouch.local_region="brush";setupBrushCanvas();');
+    const before=p.run('CURRENT_EDITOR.history.length');canvas.onpointerdown(event);const downStrokes=strokes;
+    canvas.onpointermove({...event,clientX:150});canvas.onpointerup(event);
+    assert.ok(strokes>downStrokes,'reused handlers render moves for the new editor');
+    assert.equal(p.run('CURRENT_EDITOR.brushMask'),'data:image/png;base64,NEW-STROKE');
+    assert.equal(p.get('editUndo').disabled,false,'new stroke is undoable in the replacement editor');
+    p.run('flushEditorGesture()');
+    assert.equal(p.run('CURRENT_EDITOR.history.length'),before+1);
+    canvas.onpointerdown(event);p.run('closeResults()');await p.open('/photos/b.jpg');
+    const latest=p.run('CURRENT_EDITOR');const latestHistory=latest.history.length;
+    canvas.onpointerup(event);
+    assert.equal(latest.brushMask,null,'a stale gesture cannot commit into the replacement editor');
+    assert.equal(latest.history.length,latestHistory);
+    assert.equal(canvas._brushDrawing,false);
   });
   await test('mask waits for corresponding frame and mask decode and rejects late decode callbacks',async()=>{
     let sequence=0;const p=await editorPage(path=>path==='/api/process_one'?{before:'/before',after:'/frame'+ ++sequence,region_mask:'/mask'+sequence}:undefined);await p.open();p.mask(true);await p.run('refreshEditorPreview()');assert.equal(p.requests.at(-1).body.show_mask,true);const mask=p.get('editRegionMask'),image=p.get('editStage').querySelector('img.b');assert.equal(mask.hidden,true);

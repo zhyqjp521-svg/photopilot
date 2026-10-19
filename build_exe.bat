@@ -60,7 +60,7 @@ echo.
 
 REM ---------- 4) build the exe ----------
 echo [4/4] Building dist\PhotoPilot.exe ...
-"%VENV_PY%" scripts\build_windows.py || goto :fail
+"%VENV_PY%" scripts\build_windows.py --allow-missing-aesthetic || goto :fail
 echo.
 
 echo ============================================================

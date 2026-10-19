@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import copy
+import base64
 import contextlib
 import http.client
 import importlib
 import importlib.util
 import json
+import io
 import os
 import tempfile
 import threading
@@ -78,10 +80,91 @@ class ProjectTests(unittest.TestCase):
             'selection_touched': False, 'settings': {}, 'drafts': {},
             'scan_incomplete': False})
 
+    def test_large_brush_mask_roundtrips_in_v2_current_and_history_drafts(self):
+        # A real canvas-sized PNG, not an artificially enlarged JSON string.
+        image = Image.frombytes('RGBA', (160, 160), bytes(range(256)) * 400)
+        output = io.BytesIO()
+        image.save(output, format='PNG', compress_level=0)
+        mask = 'data:image/png;base64,' + base64.b64encode(output.getvalue()).decode('ascii')
+        self.assertGreater(len(mask), 16384)
+        state = copy.deepcopy(self.state)
+        state['drafts'] = {str(self.original): {'version': 2, 'retouch': {'brush_mask': mask},
+            'retouchHistory': [{'brush_mask': mask}, {'brush_mask': None}]}}
+        before = self.original.read_bytes()
+        self.store.save(state)
+        loaded = self.project.ProjectStore(self.path).load()
+        self.assertEqual(loaded['state']['drafts'], state['drafts'])
+        self.assertEqual(self.original.read_bytes(), before)
+
+    def test_large_brush_exception_cannot_escape_its_draft_slots_or_limits(self):
+        output = io.BytesIO()
+        Image.new('RGBA', (128, 128), 'white').save(output, format='PNG', compress_level=0)
+        mask = 'data:image/png;base64,' + base64.b64encode(output.getvalue()).decode('ascii')
+        draft = {'version': 2, 'retouch': {'brush_mask': mask}, 'retouchHistory': [{'brush_mask': mask}]}
+        variants = [
+            {'settings': {'retouch': {'brush_mask': mask}}},
+            {'drafts': {str(self.original): dict(draft, other={'brush_mask': mask})}},
+            {'drafts': {str(self.original): dict(draft, version=1)}},
+            {'drafts': {'not-a-photo': draft}},
+            {'drafts': {str(self.original): {'version': 2, 'retouch': {'brush_mask': 'x' * 20000}}}},
+            {'drafts': {str(self.original): {'version': 2, 'retouch': {'brush_mask':
+                'data:image/png;base64,' + 'A' * (8 * 1024 * 1024)}}}},
+            {'settings': {'brush_mask': mask}},
+            {'drafts': {str(self.original): {'version': 2, 'retouch': {'brush_mask':
+                'data:image/png;base64,' + '!' * 20000}}}},
+            {'drafts': {str(self.original): {'version': 2, 'retouch': {'brush_mask':
+                'data:image/png;base64,' + base64.b64encode(b'not a PNG' * 3000).decode('ascii')}}}},
+        ]
+        for changes in variants:
+            with self.subTest(changes=str(changes)[:90]):
+                with self.assertRaises(ValueError):
+                    self.store.save(dict(self.state, **changes))
+        self.assertFalse(self.path.exists())
+
+    def test_large_brush_png_dimensions_are_checked_without_lifting_json_limits(self):
+        for size in ((8193, 1), (4097, 4096)):
+            with self.subTest(size=size):
+                output = io.BytesIO()
+                Image.new('RGBA' if size[1] == 1 else 'L', size, 255).save(
+                    output, format='PNG', compress_level=0 if size[1] == 1 else 6)
+                mask = 'data:image/png;base64,' + base64.b64encode(output.getvalue()).decode('ascii')
+                self.assertGreater(len(mask), 16384)
+                state = dict(self.state, drafts={str(self.original): {'version': 2,
+                    'retouch': {'brush_mask': mask}}})
+                with self.assertRaisesRegex(ValueError, 'brush mask'):
+                    self.store.save(state)
+        self.assertFalse(self.path.exists())
+
+    def test_legacy_v1_and_empty_v2_editor_drafts_remain_compatible(self):
+        for draft in ({'version': 1, 'history': [{'exposure': .5}], 'tone': {'exposure': .5}, 'index': 0},
+                      {'version': 2, 'retouch': {'brush_mask': None}, 'retouchHistory': [{'brush_mask': None}]}):
+            with self.subTest(version=draft['version']):
+                state = dict(self.state, drafts={str(self.original): draft})
+                self.store.save(state)
+                self.assertEqual(self.store.load()['state']['drafts'], state['drafts'])
+
+    def test_large_brush_masks_still_obey_total_checkpoint_budget(self):
+        output = io.BytesIO()
+        Image.new('RGBA', (128, 128), 'white').save(output, format='PNG', compress_level=0)
+        mask = 'data:image/png;base64,' + base64.b64encode(output.getvalue()).decode('ascii')
+        state = dict(self.state, drafts={str(self.original): {'version': 2,
+            'retouch': {'brush_mask': mask}, 'retouchHistory': [{'brush_mask': mask}]}})
+        with patch.object(self.project, 'MAX_PROJECT_BYTES', len(mask) + 500):
+            with self.assertRaisesRegex(ValueError, 'size limit'):
+                self.store.save(state)
+        self.assertFalse(self.path.exists())
+
     def test_default_data_location_and_environment_override(self):
-        with patch.dict(os.environ, {}, clear=True), patch.object(Path, 'home', return_value=self.root):
-            self.assertEqual(self.project.ProjectStore().path,
-                             self.root / 'Library/Application Support/PhotoPilot/project.json')
+        if os.name == 'nt':
+            appdata = self.root / 'AppData/Roaming'
+            environment = {'APPDATA': str(appdata)}
+            expected = appdata / 'PhotoPilot/project.json'
+        else:
+            environment = {}
+            expected = self.root / 'Library/Application Support/PhotoPilot/project.json'
+        with (patch.dict(os.environ, environment, clear=True),
+              patch.object(Path, 'home', return_value=self.root)):
+            self.assertEqual(self.project.ProjectStore().path, expected)
         with patch.dict(os.environ, {'PHOTOPILOT_PROJECT_PATH': str(self.path)}):
             self.assertEqual(self.project.ProjectStore().path, self.path)
 

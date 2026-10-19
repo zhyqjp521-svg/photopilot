@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+import base64
+import binascii
+import io
 import math
 import os
 import tempfile
@@ -11,12 +14,33 @@ import urllib.parse
 from functools import lru_cache
 from pathlib import Path
 
+from PIL import Image
+
 from .xmp import read_rating
 
 MAX_PROJECT_BYTES = 64 * 1024 * 1024
 MAX_PHOTOS = 100000
 MAX_DEPTH = 16
 _PROTOTYPE_KEYS = {'__proto__', 'prototype', 'constructor'}
+_MAX_BRUSH_MASK_CHARS = 8 * 1024 * 1024
+
+
+def _large_brush_mask(value: str) -> None:
+    """Validate a canvas PNG without decoding/allocating its pixel raster."""
+    prefix = 'data:image/png;base64,'
+    if len(value) >= _MAX_BRUSH_MASK_CHARS or not value.startswith(prefix):
+        raise ValueError('project brush mask exceeds limit or is not a PNG data URL')
+    try:
+        data = base64.b64decode(value[len(prefix):], validate=True)
+        if not data.startswith(b'\x89PNG\r\n\x1a\n'):
+            raise ValueError('not a PNG')
+        with Image.open(io.BytesIO(data)) as image:
+            width, height = image.size
+            if width > 8192 or height > 8192 or width * height > 16777216:
+                raise ValueError('PNG dimensions exceed limit')
+            image.verify()
+    except (ValueError, OSError, SyntaxError, binascii.Error, Image.DecompressionBombError) as exc:
+        raise ValueError('project brush mask is invalid') from exc
 
 
 def default_project_path() -> Path:
@@ -32,7 +56,25 @@ def _bounded_json(value) -> None:
     budget = MAX_PROJECT_BYTES
     nodes = 0
 
-    def visit(item, depth):
+    # Only actual v2 photo drafts may carry a large encoded canvas. Settings,
+    # arbitrary nested brush_mask keys, legacy drafts and object keys keep the
+    # ordinary string limit. Do not loosen the entire checkpoint schema.
+    photos = value.get('photos', []) if isinstance(value, dict) else []
+    photo_paths = {photo['path'] for photo in photos
+                   if isinstance(photo, dict) and isinstance(photo.get('path'), str)} if isinstance(photos, list) else set()
+    drafts = value.get('drafts', {}) if isinstance(value, dict) else {}
+
+    def brush_slot(path):
+        if (len(path) not in (4, 5) or path[0] != 'drafts' or path[1] not in photo_paths
+                or not isinstance(drafts, dict)):
+            return False
+        draft = drafts.get(path[1])
+        return (isinstance(draft, dict) and type(draft.get('version')) is int
+                and draft['version'] == 2 and path[-1] == 'brush_mask'
+                and ((len(path) == 4 and path[2] == 'retouch')
+                     or (len(path) == 5 and path[2] == 'retouchHistory' and type(path[3]) is int)))
+
+    def visit(item, depth, path=()):
         nonlocal budget, nodes
         nodes += 1
         if depth > MAX_DEPTH or nodes > 1000000:
@@ -43,14 +85,16 @@ def _bounded_json(value) -> None:
                 if not isinstance(key, str) or key in _PROTOTYPE_KEYS:
                     raise ValueError('project JSON contains an unsafe object key')
                 visit(key, depth + 1)
-                visit(child, depth + 1)
+                visit(child, depth + 1, path + (key,))
         elif isinstance(item, list):
             budget -= 2 + len(item)
-            for child in item:
-                visit(child, depth + 1)
+            for index, child in enumerate(item):
+                visit(child, depth + 1, path + (index,))
         elif isinstance(item, str):
             if len(item) > 16384:
-                raise ValueError('project JSON string exceeds limit')
+                if not brush_slot(path):
+                    raise ValueError('project JSON string exceeds limit')
+                _large_brush_mask(item)
             budget -= len(json.dumps(item, ensure_ascii=False).encode('utf-8'))
         elif item is None or isinstance(item, bool):
             budget -= 5
@@ -102,6 +146,10 @@ def _photo(raw) -> dict:
     photo = {'path': _path(raw.get('path'), 'photo path')}
     for field in ('width', 'height'):
         photo[field] = _number(raw.get(field), field, 1, 200000, integer=True)
+    for field in ('original_width', 'original_height'):
+        photo[field] = _number(raw.get(field, 0), field, 0, 200000, integer=True)
+    photo['file_size'] = (None if raw.get('file_size') is None else
+                          _number(raw['file_size'], 'file_size', 0, 2**53-1, integer=True))
     photo['score'] = _number(raw.get('score'), 'score', 0, 1)
     for field in ('sharpness', 'exposure', 'contrast', 'colorfulness', 'face_quality'):
         photo[field] = _number(raw.get(field, .5 if field == 'face_quality' else 0), field, 0, 1)
@@ -215,6 +263,19 @@ class ProjectStore:
                     missing.append(path)
                 elif current != saved:
                     changed.append(path)
+                if current is not None:
+                    photo['file_size'] = current['size']
+                    if not photo['original_width'] or not photo['original_height']:
+                        # Header-only backfill for legacy raster records. Never
+                        # develop RAWs or mistake working-preview dimensions for originals.
+                        try:
+                            from .io import RAW_EXTS
+                            if Path(path).suffix.lower() not in RAW_EXTS:
+                                with Image.open(path) as image:
+                                    if 0 < image.width <= 200000 and 0 < image.height <= 200000:
+                                        photo.update(original_width=image.width, original_height=image.height)
+                        except (OSError, ValueError, Image.DecompressionBombError):
+                            pass
                 photo['rating'] = read_rating(path, manual_only=True) or 0
                 photo['thumb'] = f'/api/thumb?p={urllib.parse.quote(path)}&s=360'
             return {'state': state, 'missing': missing, 'changed': changed}

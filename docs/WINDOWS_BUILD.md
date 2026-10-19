@@ -53,7 +53,7 @@ pip install pyinstaller
 
 ```bat
 :: 在 Windows 上，仓库根目录
-python scripts\build_windows.py            :: 生成 dist\PhotoPilot.exe
+python scripts\build_windows.py --allow-missing-aesthetic  :: 无模型权重也能构建
 python scripts\build_windows.py --console  :: 另生成带控制台的排障版
 python scripts\build_windows.py --clean    :: 构建前清理缓存
 ```
@@ -62,9 +62,10 @@ python scripts\build_windows.py --clean    :: 构建前清理缓存
 
 ```bat
 pyinstaller --noconfirm --clean --onefile --windowed --name PhotoPilot ^
-  --collect-all mediapipe --collect-all onnxruntime ^
+  --collect-all mediapipe --collect-data onnxruntime --collect-binaries onnxruntime ^
+  --hidden-import webview.platforms.winforms --hidden-import webview.platforms.edgechromium ^
   --collect-data cv2 --collect-data rawpy --collect-submodules send2trash ^
-  --exclude-module matplotlib --exclude-module tkinter run_photopilot.py
+  --exclude-module tkinter run_photopilot.py
 ```
 
 ## 五、运行环境与依赖（目标机）
@@ -123,6 +124,9 @@ onnxruntime、Pillow、rawpy(LibRaw)、pywebview 等全部依赖。
    首次启动解压到临时目录会稍慢，属 one-file 正常现象。
 5. **美学模型权重**：采用 idealo/image-quality-assessment 的 MobileNet 美学权重
    （Apache-2.0），转 ONNX 后经 `--add-data` 内置到 exe（约 12.9MB），`--ai` 可用。
+   仓库出于体积与授权边界不提交模型目录。没有权重时 CI/`build_exe.bat` 会显式
+   使用 `--allow-missing-aesthetic`：传统评分、筛选、编辑、导入导出全部可用，
+   仅神经网络美学分不可用。要发布完整 AI 版，先本地放回两个 ONNX 再构建。
 6. **send2trash**：Windows/Linux 回收站依赖 `send2trash`（`pyproject.toml` 已按平台声明，
    macOS 不装）。脚本已带 `--collect-submodules send2trash`，缺失时删除原片会提示"缺少 send2trash"。
 

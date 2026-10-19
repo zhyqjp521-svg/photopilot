@@ -105,9 +105,59 @@ class BrushMaskTests(unittest.TestCase):
         mask = polish._local_mask(self.image, [], 'brush', brush_mask=self.brush)
         self.assertEqual(mask.shape, (120, 160))
         np.testing.assert_allclose(mask, self.brush)
-        # 无画笔时退化为全图（保持可用），不静默丢弃效果
+        # Empty brush must never silently turn into a full-image adjustment.
         fallback = polish._local_mask(self.image, [], 'brush')
-        np.testing.assert_allclose(fallback, np.ones((120, 160), np.float32))
+        np.testing.assert_array_equal(fallback, np.zeros((120, 160), np.float32))
+
+    def test_empty_brush_leaves_local_pixels_unchanged(self):
+        params = polish.PolishParams(wb=0, skin=.8, clarity=.8, eyes=False,
+                                     local_region='brush')
+        for mask in (None, np.zeros(self.image.shape[:2], np.float32)):
+            result = polish.polish_image(self.image, params, faces=[], brush_mask=mask)
+            np.testing.assert_array_equal(result, self.image)
+
+    def test_rgba_brush_decoder_preserves_alpha_coverage(self):
+        import base64
+        import cv2
+        rgba = np.full((1, 4, 4), 255, np.uint8)
+        rgba[0, :, 3] = [0, 64, 128, 255]
+        encoded = base64.b64encode(cv2.imencode('.png', rgba)[1]).decode()
+        decoded = server._decode_brush_mask(encoded)
+        np.testing.assert_allclose(decoded[0], np.array([0, 64, 128, 255]) / 255,
+                                   atol=1e-6)
+
+    def test_preview_and_frozen_export_keep_identical_brush_pixels(self):
+        import base64
+        import cv2
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'brush.png'
+            Image.fromarray(self.image).save(source)
+            original = source.read_bytes()
+            encoded = base64.b64encode(cv2.imencode('.png', (self.brush * 255).astype(np.uint8))[1]).decode()
+            retouch = {'local_region': 'brush', 'brush_mask': encoded, 'clarity': .8,
+                       'skin': 0, 'retain': .4, 'face_repair': 0, 'blemish': 0, 'ai_denoise': 0}
+            prepared = server._prepare({'folder': tmp, 'paths': [str(source)], 'operation': 'polish',
+                                       'export_size': 'original',
+                                       'polish': {'wb': 0, 'eyes': False, **retouch}})
+            try:
+                captured = []
+                from photopilot.io import save_image
+                def save(pixels, destination, **kwargs):
+                    captured.append(pixels.copy())
+                    return save_image(pixels, destination, **kwargs)
+                with patch.object(server, 'analyze_faces', return_value=[]), \
+                     patch.object(server, 'save_image', side_effect=save), \
+                     patch.object(server, 'THUMB_DIR', Path(tmp) / 'cache'):
+                    server._process_one({'sid': prepared['sid'], 'path': str(source), 'preview_only': True,
+                                         'retouch_adjustments': retouch})
+                    server._process_one({'sid': prepared['sid'], 'path': str(source),
+                                         'retouch_adjustments': retouch})
+                np.testing.assert_array_equal(captured[0], captured[1])
+                np.testing.assert_array_equal(captured[1][70:, 90:], self.image[70:, 90:])
+                self.assertTrue(np.any(captured[1][:50, :70] != self.image[:50, :70]))
+                self.assertEqual(source.read_bytes(), original)
+            finally:
+                server._SESSIONS.pop(prepared['sid'], None)
 
     def test_brush_mask_resized_to_image_resolution(self):
         small = np.zeros((30, 40), np.float32)

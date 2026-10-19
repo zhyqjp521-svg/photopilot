@@ -1,6 +1,6 @@
 [project]
 name = "photopilot"
-version = "0.3.0"
+version = "0.3.3"
 description = "照片筛选 / 追色 / 美化 —— 全本地流水线（cull → color-match → polish）"
 requires-python = ">=3.10"
 dependencies = [

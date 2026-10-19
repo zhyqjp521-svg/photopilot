@@ -117,7 +117,7 @@ def resize_max(img: np.ndarray, max_size: int) -> np.ndarray:
 
 
 def load_image(path: str | Path, max_size: int | None = 2048,
-               *, raw_preview: bool = False) -> np.ndarray:
+               *, raw_preview: bool = False, metadata: dict | None = None) -> np.ndarray:
     """读取为 RGB uint8 ndarray；max_size 限制长边（None 表示不缩放）。
 
     ``raw_preview`` 仅用于快速筛选：优先取 RAW 文件内嵌的 JPEG 预览，
@@ -125,11 +125,15 @@ def load_image(path: str | Path, max_size: int | None = 2048,
     """
     path = Path(path)
     ext = path.suffix.lower()
+    if metadata is not None:
+        metadata['file_size'] = path.stat().st_size
     if ext in RAW_EXTS:
         if not HAS_RAWPY:
             raise RuntimeError(f"读取 RAW 需要 rawpy：pip install rawpy（文件：{path}）")
         with RAW_DECODE_LOCK:
             with rawpy.imread(str(path)) as raw:
+                if metadata is not None:
+                    metadata.update(original_width=raw.sizes.width, original_height=raw.sizes.height)
                 if raw_preview:
                     try:
                         thumb = raw.extract_thumb()
@@ -149,6 +153,8 @@ def load_image(path: str | Path, max_size: int | None = 2048,
                                           no_auto_bright=False, output_bps=8)
     else:
         with Image.open(path) as im:
+            if metadata is not None:
+                metadata.update(original_width=im.width, original_height=im.height)
             if (max_size is not None and max_size <= DRAFT_MAX
                     and getattr(im, "format", "") in {"JPEG", "MPO"}):
                 im.draft("RGB", (max_size, max_size))  # DCT 域降采样解码

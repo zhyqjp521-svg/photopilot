@@ -62,14 +62,16 @@ def _require_pyinstaller() -> None:
         sys.exit("缺少 PyInstaller：请先 `.venv/bin/pip install pyinstaller`")
 
 
-def _build_onedir() -> Path:
+def _build_onedir(*, allow_missing_aesthetic: bool = False) -> Path:
     """PyInstaller --onedir --windowed，产出 dist/PhotoPilot（可执行文件目录）。"""
     model = ROOT / "models" / "nima_mobilenet_aesthetic_apache.onnx"
-    if not model.exists():
+    if not model.exists() and not allow_missing_aesthetic:
         sys.exit(
             "缺少美学模型 models/nima_mobilenet_aesthetic_apache.onnx：\n"
             "请先从 idealo/image-quality-assessment（Apache-2.0）下载 "
             "weights_mobilenet_aesthetic_0.07.hdf5 并转为 ONNX，或从发布包恢复。")
+    if not model.exists():
+        print('提示：本次明确跳过缺失的美学评分模型；传统评分及其他功能仍可使用。', flush=True)
     # NAFNet 去噪模型（可选）：缺失时打包仍继续，仅 AI 降噪功能不可用
     denoise_model = ROOT / "models" / "nafnet_sidd_width32.onnx"
     cmd = [
@@ -80,18 +82,36 @@ def _build_onedir() -> Path:
         # 收集内置 tflite 人脸模型与子模块（缺失则人脸检测失效）
         "--collect-all", "mediapipe",
         # NIMA 美学评分（idealo MobileNet，Apache-2.0）需要 onnxruntime 原生推理库
-        "--collect-all", "onnxruntime",
-        # 美学模型权重（aesthetic.py 经 __file__ 相对路径定位到 models/ 目录）
-        "--add-data", f"{model}:models",
+        "--collect-data", "onnxruntime",
+        "--collect-binaries", "onnxruntime",
+        # pywebview selects its Cocoa backend dynamically.
+        "--hidden-import", "webview.platforms.cocoa",
         "--collect-data", "cv2",
         "--collect-data", "rawpy",
         "--collect-submodules", "send2trash",
-        "--exclude-module", "matplotlib",
+        # MediaPipe drawing_utils imports pyplot even when no plot is drawn.
+        # Removing matplotlib silently disables the face-mesh backend.
         "--exclude-module", "tkinter",
         "--exclude-module", "pandas",
         "--exclude-module", "IPython",
+        # Only ONNX inference is used. Optional training/quantization imports
+        # otherwise pull globally installed multi-GB ML frameworks into the app.
+        "--exclude-module", "onnxruntime.quantization",
+        "--exclude-module", "onnxruntime.tools",
+        "--exclude-module", "torch",
+        "--exclude-module", "torchvision",
+        "--exclude-module", "torchaudio",
+        "--exclude-module", "tensorflow",
+        "--exclude-module", "jax",
+        "--exclude-module", "webview.platforms.qt",
+        "--exclude-module", "PyQt6",
+        "--exclude-module", "PyQt5",
+        "--exclude-module", "PySide6",
+        "--exclude-module", "PySide2",
         str(ENTRY),
     ]
+    if model.exists():
+        cmd[-1:-1] = ['--add-data', f'{model}:models']
     if denoise_model.exists():
         # AI 降噪（NAFNet SIDD）权重，denoise.py 同样按 models/ 定位
         cmd.insert(cmd.index(str(ENTRY)),
@@ -150,6 +170,8 @@ def main() -> int:
     ap.add_argument("--identity", default=None,
                     help="签名身份（默认 ad-hoc：-s -）")
     ap.add_argument("--no-sign", action="store_true", help="跳过签名")
+    ap.add_argument('--allow-missing-aesthetic', action='store_true',
+                    help='明确允许缺少美学评分模型，保留传统评分与其他功能')
     args = ap.parse_args()
 
     _check_platform()
@@ -158,13 +180,13 @@ def main() -> int:
         sys.exit(f"找不到入口脚本：{ENTRY}")
 
     _banner("打包 PhotoPilot.app（onedir，内置依赖，可分发）")
-    bundle = _build_onedir()
+    bundle = _build_onedir(allow_missing_aesthetic=args.allow_missing_aesthetic)
     _wrap_app(bundle)
     if not args.no_sign:
         _codesign(bundle, args.identity)
 
     print(f"\n完成：{bundle}", flush=True)
-    print("可拷贝到任何 macOS 11+ 的 Mac 上双击运行（目标机无需安装 Python）。")
+    print("已内置 Python 运行环境；仅适用于相同 CPU 架构。其他 macOS 版本需另行验证。")
     return 0
 
 
