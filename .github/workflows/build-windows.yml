@@ -68,23 +68,7 @@ jobs:
 
       - name: Smoke-test packaged EXE with a real photo import
         shell: pwsh
-        run: |
-          $sample = Join-Path $env:RUNNER_TEMP 'photopilot-smoke'
-          New-Item -ItemType Directory -Force -Path $sample | Out-Null
-          python -c "from PIL import Image; Image.new('RGB', (1600, 1000), (35, 120, 205)).save(r'$sample\import-test.jpg')"
-          $json = Join-Path $sample 'report.json'
-          & .\dist\PhotoPilot.exe cull $sample --no-faces --json $json
-          if ($LASTEXITCODE -ne 0) { throw "Packaged EXE cull exited with $LASTEXITCODE" }
-          $report = Get-Content $json -Raw | ConvertFrom-Json
-          if ($report.photos.Count -ne 1) { throw "Expected one imported photo, got $($report.photos.Count)" }
-          if (-not (Test-Path (Join-Path $sample 'import-test.jpg'))) { throw "Smoke fixture was unexpectedly removed" }
-          @{
-            source = $sample
-            image = (Join-Path $sample 'import-test.jpg')
-            report = $json
-            exe_sha256 = (Get-FileHash .\dist\PhotoPilot.exe -Algorithm SHA256).Hash
-          } | ConvertTo-Json | Set-Content (Join-Path $sample 'smoke.json') -Encoding utf8
-          Get-Content (Join-Path $sample 'smoke.json')
+        run: ./tests/windows_smoke.ps1
 
       - name: Show output
         run: dir dist

@@ -29,8 +29,15 @@ class WindowsBuildTests(unittest.TestCase):
         self.assertIn('npm install --no-save playwright-core', workflow)
         self.assertIn("PLAYWRIGHT_CORE: '1'", workflow)
         self.assertIn('node tests/frontend_regressions.cjs', workflow)
-        self.assertIn('PhotoPilot.exe cull', workflow)
+        self.assertIn('./tests/windows_smoke.ps1', workflow)
         self.assertIn('PhotoPilot-*-windows-x64.zip', workflow)
+        smoke = (Path(__file__).resolve().parents[1] / 'tests/windows_smoke.ps1').read_text(
+            encoding='utf-8-sig')
+        self.assertIn("'cull', $sample", smoke)
+        self.assertIn("'run', $sample", smoke)
+        self.assertIn('Start-Process', smoke)
+        self.assertIn('-Wait', smoke)
+        self.assertIn('Exported JPEG is unexpectedly small', smoke)
 
     def test_missing_aesthetic_requires_explicit_opt_in(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(builder, 'ROOT', Path(tmp)):
