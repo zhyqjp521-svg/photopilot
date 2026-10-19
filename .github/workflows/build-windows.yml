@@ -70,6 +70,20 @@ jobs:
         shell: pwsh
         run: ./tests/windows_smoke.ps1
 
+      - name: Preserve Windows smoke diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          $reports = @(Get-ChildItem $env:RUNNER_TEMP -Directory -Filter 'photopilot-smoke*')
+          if ($reports) {
+            New-Item -ItemType Directory -Force -Path dist\smoke-diagnostics | Out-Null
+            foreach ($report in $reports) {
+              Copy-Item $report.FullName -Destination dist\smoke-diagnostics -Recurse -Force
+            }
+          } else {
+            throw 'No Windows smoke diagnostics directory was found'
+          }
+
       - name: Show output
         run: dir dist
 
@@ -81,11 +95,13 @@ jobs:
           Get-FileHash "dist\PhotoPilot-$version-windows-x64.zip" -Algorithm SHA256 | Format-List
 
       - name: Upload Windows build
+        if: always() && !cancelled()
         uses: actions/upload-artifact@v4
         with:
           name: PhotoPilot-windows-x64
           path: |
             dist/PhotoPilot-*-windows-x64.zip
             dist/PhotoPilot.exe
+            dist/smoke-diagnostics/**
           if-no-files-found: error
           retention-days: 30
